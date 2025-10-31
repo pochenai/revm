@@ -3576,6 +3576,7 @@ dependencies = [
 name = "revm-context"
 version = "10.1.2"
 dependencies = [
+ "alloy-consensus",
  "bitvec",
  "cfg-if",
  "derive-where",
@@ -3586,6 +3587,7 @@ dependencies = [
  "revm-primitives",
  "revm-state",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

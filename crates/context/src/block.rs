@@ -1,6 +1,15 @@
 //! This module contains [`BlockEnv`] and it implements [`Block`] trait.
+use std::io::Read;
+use std::{any::Any, fs::File};
+
+use alloy_consensus::{EthereumTxEnvelope, Header, Transaction, TxEip4844};
+use bitvec::vec;
 use context_interface::block::{BlobExcessGasAndPrice, Block};
+use context_interface::either::Either;
+use context_interface::transaction::{AccessList, RecoveredAuthorization, SignedAuthorization};
 use primitives::{eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE, Address, B256, U256};
+
+use crate::TxEnv;
 
 /// The block environment
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -114,5 +123,81 @@ impl Default for BlockEnv {
                 BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE,
             )),
         }
+    }
+}
+
+///
+pub type RethBlock = alloy_consensus::Block<EthereumTxEnvelope<TxEip4844>>;
+
+/// import blocks from json file
+pub fn import_blocks() -> Vec<RethBlock> {
+    let mut file = File::open("/home/po/now/reth/crates/cli/commands/src/blocks.json")
+        .ok()
+        .unwrap();
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).ok().unwrap();
+
+    serde_json::from_str(&contents).unwrap()
+}
+
+/// Convert json tx data to revm::TxEnv
+pub fn envelope_to_txenv(envelope: &EthereumTxEnvelope<TxEip4844>) -> TxEnv {
+    // Extract inner transaction
+    let sig_hash = envelope.signature_hash();
+    let blob_hashes = if let Some(h) = envelope.blob_versioned_hashes() {
+        h.into()
+    } else {
+        vec![]
+    };
+    let acl = if let Some(a) = envelope.access_list() {
+        a.clone()
+    } else {
+        AccessList::default()
+    };
+
+    TxEnv {
+        tx_type: envelope.tx_type() as u8,
+        caller: envelope
+            .signature()
+            .recover_address_from_prehash(&sig_hash)
+            .ok()
+            .unwrap(), // depends on your envelope source
+        gas_limit: envelope.gas_limit(),
+        gas_price: envelope.max_fee_per_gas(), // you can use effective gas price here if needed
+        kind: envelope.kind(),
+        value: envelope.value(),
+        data: envelope.input().clone(),
+        nonce: envelope.nonce(),
+        chain_id: envelope.chain_id(),
+        access_list: acl,
+        gas_priority_fee: envelope.max_priority_fee_per_gas(),
+        blob_hashes: blob_hashes,
+        max_fee_per_blob_gas: envelope.max_fee_per_blob_gas().unwrap_or_default(),
+        authorization_list: signauth_to_eitherauth(envelope.authorization_list()),
+    }
+}
+
+fn signauth_to_eitherauth(
+    auth_list: Option<&[SignedAuthorization]>,
+) -> Vec<Either<SignedAuthorization, RecoveredAuthorization>> {
+    let auth_list: Vec<SignedAuthorization> = if let Some(list) = auth_list {
+        list.into()
+    } else {
+        vec![]
+    };
+    let mut res = Vec::with_capacity(auth_list.len());
+    for auth in auth_list {
+        res.push(Either::Left(auth));
+    }
+    res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_import_block() {
+        let blocks = import_blocks();
+        println!("{:?}", blocks)
     }
 }

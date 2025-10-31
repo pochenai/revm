@@ -1,3 +1,4 @@
+pub mod bal_test;
 pub mod bench;
 pub mod blockchaintest;
 pub mod bytecode;
