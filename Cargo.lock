@@ -3762,6 +3762,8 @@ dependencies = [
 name = "revme"
 version = "8.3.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
  "alloy-rlp",
  "alloy-sol-types",
  "clap",
@@ -3771,6 +3773,7 @@ dependencies = [
  "indicatif",
  "k256",
  "plain_hasher",
+ "rayon",
  "revm",
  "revm-statetest-types",
  "serde",

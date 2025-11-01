@@ -1,19 +1,113 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, iter::zip, sync::Arc};
 
+use alloy_primitives::{bytes, Bytes};
+use k256::elliptic_curve::consts::{False, True};
 use revm::{
+    bytecode::bitvec::index,
     context::{
         self,
-        block::{envelope_to_txenv, import_blocks},
+        block_states::{
+            envelope_to_txenv, import_struct, prestates_to_cachedbs, write_data, PreblockState,
+            RethBlock,
+        },
         cfg::CfgEnv,
         transaction::AccessList,
         BlockEnv, ContextTr, TxEnv,
     },
     context_interface::block::BlobExcessGasAndPrice,
-    database::{bal::BalDatabase, State},
-    primitives::{address, hardfork::SpecId, hex::FromHex, Address, HashMap, KECCAK_EMPTY, U256},
-    state::{AccountInfo, Bytecode},
-    Context, Database, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
+    database::{
+        bal::{self, BalDatabase},
+        states::{cache, changes},
+        Cache, CacheState, State,
+    },
+    primitives::{
+        address, alloy_primitives, hardfork::SpecId, hex::FromHex, Address, HashMap, B256,
+        KECCAK_EMPTY, U256,
+    },
+    state::{bal::Bal, Account, AccountInfo, Bytecode},
+    Context, Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
+    SystemCallEvm,
 };
+
+use alloy_consensus::{EthereumTxEnvelope, TxEip4844};
+
+use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
+
+use clap::Parser;
+use std::time::Instant;
+
+pub const SYSTEM_ADDRESS: Address = address!("fffffffffffffffffffffffffffffffffffffffe");
+
+/// The address for the EIP-4788 beacon roots contract.
+pub const BEACON_ROOTS_ADDRESS: Address = address!("000F3df6D732807Ef1319fB7B8bB8522d0Beac02");
+
+/// The code for the EIP-4788 beacon roots contract.
+pub static BEACON_ROOTS_CODE: Bytes = bytes!("3373fffffffffffffffffffffffffffffffffffffffe14604d57602036146024575f5ffd5b5f35801560495762001fff810690815414603c575f5ffd5b62001fff01545f5260205ff35b5f5ffd5b62001fff42064281555f359062001fff015500");
+
+/// The address for the EIP-2935 history storage contract.
+pub const HISTORY_STORAGE_ADDRESS: Address = address!("0x0000F90827F1C53a10cb7A02335B175320002935");
+
+/// The code for the EIP-2935 history storage contract.
+pub static HISTORY_STORAGE_CODE: Bytes = bytes!("3373fffffffffffffffffffffffffffffffffffffffe14604657602036036042575f35600143038111604257611fff81430311604257611fff9006545f5260205ff35b5f5ffd5b5f35611fff60014303065500");
+
+/// EIP-2935: Serve historical block hashes from state
+///
+/// Number of block hashes the EVM can access in the past (Prague).
+///
+/// # Note
+///
+/// Updated from 8192 to 8191 in <https://github.com/ethereum/EIPs/pull/9144>
+pub const HISTORY_SERVE_WINDOW: usize = 8191;
+
+/// Debug: validate bals and write input/output bals to bal-in.json and bal-out.json.
+const DEBUG: bool = false;
+
+/// `statetest` subcommand
+#[derive(Parser, Debug)]
+pub struct Cmd {
+    /// Run tests in multiple thread
+    #[arg(short = 't', short, default_value_t = 1)]
+    threads: usize,
+    /// Enable parallel execution by default (exe sequentially is the same as setting -t 1)
+    #[arg(short = 'p', short, default_value_t = true)]
+    par: bool,
+}
+
+macro_rules! measure {
+    ($name:expr, $block:expr) => {{
+        let start = Instant::now();
+        let result = $block;
+        let elapsed = start.elapsed();
+        println!("{} exe took: {:?}", $name, elapsed);
+        result
+    }};
+}
+
+impl Cmd {
+    /// Runs `statetest` command.
+    pub fn run(&self) -> Result<(), super::Error> {
+        // Push the file in revme/data directory
+        let blocks = import_struct("./data/blocks.json");
+        let bals: Vec<Bal> = import_struct("./data/bals.json");
+        let prestates = import_struct("./data/prestates.json");
+        let block_hashes = import_struct("./data/blockHashes.json");
+
+        let caches = prestates_to_cachedbs(prestates);
+
+        let task_name = format!("threads: {}", self.threads);
+        measure!(
+            task_name,
+            if self.par {
+                execute_blocks_par(blocks, bals, caches, block_hashes, self.threads);
+            } else {
+                execute_blocks(blocks, bals, caches, block_hashes);
+            }
+        );
+
+        Ok(())
+    }
+}
 
 #[test]
 fn test_bal() {
@@ -21,11 +115,11 @@ fn test_bal() {
     state.bal_index = 0;
     let acct1 = AccountInfo {
         balance: U256::MAX,
-        /// Account nonce.
+        // Account nonce.
         nonce: 0,
-        /// Hash of the raw bytes in `code`, or [`KECCAK_EMPTY`].
+        // Hash of the raw bytes in `code`, or [`KECCAK_EMPTY`].
         code_hash: KECCAK_EMPTY,
-        /// Storage id.
+        // Storage id.
         storage_id: None,
         code: Some(Bytecode::default()),
     };
@@ -33,11 +127,11 @@ fn test_bal() {
 
     let acct2 = AccountInfo {
         balance: U256::ZERO,
-        /// Account nonce.
+        // Account nonce.
         nonce: 1,
-        /// Hash of the raw bytes in `code`, or [`KECCAK_EMPTY`].
+        // Hash of the raw bytes in `code`, or [`KECCAK_EMPTY`].
         code_hash: KECCAK_EMPTY,
-        /// Storage id.
+        // Storage id.
         storage_id: None,
         code: Some(Bytecode::default()),
     };
@@ -87,8 +181,15 @@ fn test_bal() {
     }
 }
 
-fn execute_blocks(blocks: Vec<context::block::RethBlock>) {
-    for block in blocks {
+/// execute blocks sequentially
+fn execute_blocks(
+    blocks: Vec<RethBlock>,
+    bals: Vec<Bal>,
+    caches: Vec<CacheState>,
+    block_hashes: BTreeMap<u64, B256>,
+) {
+    for (index, (block, (mut bal, cache))) in zip(blocks, zip(bals, caches)).into_iter().enumerate()
+    {
         let block_env = BlockEnv {
             number: U256::from(block.number),
             beneficiary: block.beneficiary,
@@ -103,30 +204,230 @@ fn execute_blocks(blocks: Vec<context::block::RethBlock>) {
             )),
         };
 
-        let body = block.into_body();
-        for (index, tx) in body.transactions.iter().enumerate() {
-            let block_env_clone = block_env.clone();
-            let mut state = BalDatabase::new(State::builder().build()).with_bal_builder();
-            state.bal_index = index as u64;
-            // Create EVM context for each transaction to ensure fresh state access
-            let evm_context = Context::mainnet()
-                .with_block(block_env_clone)
-                .with_db(&mut state);
+        let bal_arc = Arc::new(bal.clone());
 
-            let mut evm = evm_context.build_mainnet();
-            let txenv = envelope_to_txenv(tx);
-            println!(
-                "txid {} sender: {:?}, kind:{:?}",
-                index, txenv.caller, txenv.tx_type
+        let parent_hash = block.parent_hash;
+        let parent_beacon_root = block.parent_beacon_block_root.unwrap();
+        let body = block.into_body();
+
+        // // TODO: pre-tx bals
+        // let block_env_clone = block_env.clone();
+        // let cached_state = State::builder()
+        //     .with_block_hashes(block_hashes.clone())
+        //     .with_cached_prestate(cache.clone())
+        //     .build();
+        // let mut state = BalDatabase::new(cached_state)
+        //     .with_bal_builder()
+        //     .with_bal_option(Some(bal_arc.clone()));
+        // state.bal_index = 0;
+        // let evm_context = Context::mainnet()
+        //     .with_block(block_env_clone)
+        //     .with_db(&mut state);
+
+        // let mut evm = evm_context.build_mainnet();
+        // // pre-tx: apply_blockhashes_contract_call
+        // let exe_result = evm.system_call_one_with_caller(
+        //     SYSTEM_ADDRESS,
+        //     HISTORY_STORAGE_ADDRESS,
+        //     parent_hash.into(),
+        // );
+        // if exe_result.is_err() {
+        //     eprintln!("{:?}", exe_result.err());
+        //     panic!(
+        //         "hash execution error for block: {} tx: {}",
+        //         block_env.number, 0
+        //     )
+        // }
+        // // pre-tx: apply_beacon_root_contract_call
+        // let exe_result = evm.system_call_one_with_caller(
+        //     SYSTEM_ADDRESS,
+        //     BEACON_ROOTS_ADDRESS,
+        //     parent_beacon_root.into(),
+        // );
+        // if exe_result.is_err() {
+        //     eprintln!("{:?}", exe_result.err());
+        //     panic!(
+        //         "root execution error for block: {} tx: {}",
+        //         block_env.number, 0
+        //     )
+        // }
+        // let changes = state.changes;
+        // output_bals.merge_bal(changes, state.bal_index);
+
+        // txs
+        let mut results = Vec::with_capacity(body.transactions.len());
+        for (tx_index, tx) in body.transactions.iter().enumerate() {
+            let changes = handle_tx(
+                block_env.clone(),
+                block_hashes.clone(),
+                bal_arc.clone(),
+                cache.clone(),
+                tx_index as u64,
+                tx,
             );
-            let exe_result = evm.transact(txenv);
-            print!("exe_result:{:?}", exe_result)
+            results.push((tx_index as u64 + 1, changes));
         }
+
+        // TODO: add post-tx bals
+
+        if DEBUG {
+            let mut output_bals = Bal::default();
+            for (bal_index, changes) in results {
+                output_bals.merge_bal(changes, bal_index);
+            }
+            output_bals.accounts.sort_keys();
+            // remove pre-tx and post-tx bals
+            bal.remove_first_last();
+            bal.accounts.sort_keys();
+            write_data("bal-in.json", &bal);
+            write_data("bal-out.json", &output_bals);
+            assert_eq!(
+                output_bals, bal,
+                "bals for tx {} in block {} is not equal",
+                index, block_env.number
+            )
+        }
+    }
+}
+
+fn handle_tx(
+    block_env: BlockEnv,
+    block_hashes: BTreeMap<u64, B256>,
+    bal_arc: Arc<Bal>,
+    cache: CacheState,
+    tx_index: u64, // tx index start from 0, while the first tx's bal index is 1
+    tx: &EthereumTxEnvelope<TxEip4844>,
+) -> HashMap<Address, Account> {
+    let cached_state = State::builder()
+        .with_block_hashes(block_hashes)
+        .with_cached_prestate(cache)
+        .build();
+    let mut state = BalDatabase::new(cached_state)
+        .with_bal_builder()
+        .with_bal_option(Some(bal_arc));
+    state.bal_index = tx_index + 1;
+
+    let blocknumber = block_env.number;
+    // Create EVM context for each transaction to ensure fresh state access
+    let evm_context = Context::mainnet().with_block(block_env).with_db(&mut state);
+
+    let mut evm = evm_context.build_mainnet();
+    let txenv = envelope_to_txenv(tx);
+    // println!(
+    //     "txid {} sender: {:?}, kind:{:?}",
+    //     index, txenv.caller, txenv.tx_type
+    // );
+    let exe_result = evm.transact(txenv);
+    if exe_result.is_err() {
+        eprintln!("{:?}", exe_result.err());
+        panic!(
+            "execution error for block: {} tx: {}",
+            blocknumber, tx_index
+        )
+    } else {
+        // println!(
+        //     "execute success for block: {} tx: {}",
+        //     blocknumber, tx_index
+        // )
+    }
+
+    // must commit state changes, or bal builder will have nothing
+    let result_state = exe_result.unwrap().state;
+    evm.commit(result_state);
+    state.changes
+    // print!("exe_result:{:?}", exe_result)
+}
+
+/// execute blocks sequentially
+fn execute_blocks_par(
+    blocks: Vec<RethBlock>,
+    bals: Vec<Bal>,
+    caches: Vec<CacheState>,
+    block_hashes: BTreeMap<u64, B256>,
+    num_threads: usize,
+) {
+    for (index, (block, (mut bal, cache))) in zip(blocks, zip(bals, caches)).into_iter().enumerate()
+    {
+        let block_env = BlockEnv {
+            number: U256::from(block.number),
+            beneficiary: block.beneficiary,
+            timestamp: U256::from(block.timestamp),
+            gas_limit: block.gas_limit,
+            basefee: block.base_fee_per_gas.unwrap(),
+            difficulty: block.difficulty,
+            prevrandao: Some(block.mix_hash),
+            blob_excess_gas_and_price: Some(BlobExcessGasAndPrice::new_with_spec(
+                block.excess_blob_gas.unwrap(),
+                SpecId::PRAGUE,
+            )),
+        };
+
+        let bal_arc = Arc::new(bal.clone());
+
+        let parent_hash = block.parent_hash;
+        let parent_beacon_root = block.parent_beacon_block_root.unwrap();
+        let body = block.into_body();
+
+        // parallel execute txs
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .expect("Failed to build Rayon pool");
+
+        pool.install(|| {
+            let results = body
+                .transactions
+                .par_iter()
+                .enumerate()
+                .map(|(index, tx)| -> (u64, HashMap<Address, Account>) {
+                    let changes = handle_tx(
+                        block_env.clone(),
+                        block_hashes.clone(),
+                        bal_arc.clone(),
+                        cache.clone(),
+                        index as u64,
+                        tx,
+                    );
+                    (index as u64 + 1, changes)
+                })
+                .collect::<Vec<(u64, HashMap<Address, Account>)>>();
+
+            if DEBUG {
+                let mut output_bals = Bal::default();
+                for (bal_index, changes) in results {
+                    output_bals.merge_bal(changes, bal_index);
+                }
+                output_bals.accounts.sort_keys();
+                bal.accounts.sort_keys();
+                assert_eq!(
+                    output_bals, bal,
+                    "bals for block {} is not equal",
+                    block_env.number
+                )
+            }
+        });
     }
 }
 
 #[test]
 fn test_exe_blocks() {
-    let blocks = import_blocks();
-    execute_blocks(blocks);
+    let blocks = import_struct("./data/blocks.json");
+    let bals: Vec<Bal> = import_struct("./data/bals.json");
+    let prestates = import_struct("./data/prestates.json");
+    let block_hashes = import_struct("./data/blockHashes.json");
+
+    let caches = prestates_to_cachedbs(prestates);
+
+    execute_blocks(blocks, bals, caches, block_hashes);
+}
+
+#[test]
+fn test_par_exe_blocks() {
+    let blocks = import_struct("./data/blocks.json");
+    let bals: Vec<Bal> = import_struct("./data/src/bals.json");
+    let prestates = import_struct("./data/prestates.json");
+    let block_hashes = import_struct("./data/blockHashes.json");
+
+    let caches = prestates_to_cachedbs(prestates);
+    execute_blocks_par(blocks, bals, caches, block_hashes, 5);
 }

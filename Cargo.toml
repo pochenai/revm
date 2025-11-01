@@ -116,6 +116,9 @@ rand = "0.9"
 tokio = "1.47"
 either = { version = "1.15.0", default-features = false }
 
+# rayon
+rayon = "1.11"
+
 # dev-dependencies
 anyhow = "1.0.99"
 eyre = "0.6.12"

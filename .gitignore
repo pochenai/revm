@@ -27,5 +27,8 @@ rustc-ice-*
 # Fixtures
 /test-fixtures
 
-# blocks and bals
+# blocks, bals, pre-block states, blockHashes
 *.json
+log.txt
+# don't ignore in-memory state for others to reproduce
+!bins/revme/data/*  

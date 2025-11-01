@@ -21,9 +21,9 @@ use std::sync::Arc;
 pub use account::{AccountBal, AccountInfoBal, StorageBal};
 pub use writes::BalWrites;
 
-use crate::{Account, AccountInfo};
+use crate::{Account, AccountInfo, EvmState};
 use alloy_eip7928::BlockAccessList as AlloyBal;
-use primitives::{Address, IndexMap, StorageKey, StorageValue};
+use primitives::{Address, HashSet, IndexMap, StorageKey, StorageValue};
 
 /// Block access index (0 for pre-execution, 1..n for transactions, n+1 for post-execution)
 pub type BalIndex = u64;
@@ -132,6 +132,52 @@ impl Bal {
     pub fn update_account(&mut self, bal_index: BalIndex, address: Address, account: &Account) {
         let bal_account = self.accounts.entry(address).or_default();
         bal_account.update(bal_index, account);
+    }
+
+    /// Extent BAL with each tx's changes
+    pub fn merge_bal(&mut self, changes: EvmState, bal_index: BalIndex) {
+        for (address, account) in changes.iter() {
+            self.update_account(bal_index, *address, account);
+        }
+    }
+
+    /// Remove bals whose index is in idxs
+    pub fn remove_at_ids(&mut self, idxs: Vec<BalIndex>) {
+        if idxs.is_empty() {
+            return;
+        }
+
+        let id_set: HashSet<BalIndex> = idxs.into_iter().collect();
+
+        for (_address, bal_account) in self.accounts.iter_mut() {
+            // remove account info writes for matching indices
+            bal_account
+                .account_info
+                .nonce
+                .writes
+                .retain(|(i, _)| !id_set.contains(i));
+            bal_account
+                .account_info
+                .balance
+                .writes
+                .retain(|(i, _)| !id_set.contains(i));
+            bal_account
+                .account_info
+                .code
+                .writes
+                .retain(|(i, _)| !id_set.contains(i));
+
+            // remove storage writes for matching indices
+            for (_key, slot) in bal_account.storage.storage.iter_mut() {
+                slot.writes.retain(|(i, _)| !id_set.contains(i));
+            }
+        }
+    }
+
+    /// remove pre and post tx bals
+    pub fn remove_first_last(&mut self) {
+        let idxs = vec![0, self.accounts.len() as u64 + 1];
+        self.remove_at_ids(idxs);
     }
 
     /// Populate account from BAL. Return true if account info got changed

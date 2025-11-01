@@ -27,6 +27,8 @@ pub struct BalDatabase<DB> {
     pub bal_index: u64,
     /// Database.
     pub db: DB,
+    /// changes in each transaction to facilate merge bal
+    pub changes: EvmState,
 }
 
 impl<DB> Deref for BalDatabase<DB> {
@@ -52,6 +54,7 @@ impl<DB> BalDatabase<DB> {
             bal_builder: None,
             bal_index: 0,
             db,
+            changes: EvmState::default(),
         }
     }
 
@@ -195,6 +198,8 @@ impl<DB: DatabaseCommit> DatabaseCommit for BalDatabase<DB> {
                 bal_builder.update_account(self.bal_index, *address, account);
             }
         }
+        // save changes in each transaction to facilate merge bal
+        self.changes = changes.clone();
         self.db.commit(changes);
     }
 }

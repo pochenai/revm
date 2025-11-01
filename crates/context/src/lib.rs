@@ -8,6 +8,7 @@
 pub use context_interface::*;
 
 pub mod block;
+pub mod block_states;
 pub mod cfg;
 pub mod context;
 pub mod evm;

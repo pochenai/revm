@@ -25,6 +25,8 @@ pub enum MainCmd {
     Blockchaintest(blockchaintest::Cmd),
     /// Execute Ethereum blockchain tests.
     Btest(blockchaintest::Cmd),
+    /// Execute Bal in memory execution benchmark.
+    Baltest(bal_test::Cmd),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +53,7 @@ impl MainCmd {
                 cmd.run();
             }
             Self::Blockchaintest(cmd) | Self::Btest(cmd) => cmd.run()?,
+            Self::Baltest(cmd) => cmd.run()?,
         }
         Ok(())
     }

@@ -34,12 +34,13 @@ bitvec.workspace = true
 serde = { workspace = true, features = ["derive", "rc"], optional = true }
 serde_json = { workspace = true, features = ["std", "alloc"] }
 alloy-consensus = { workspace = true, features = ["serde"] }
-
-[dev-dependencies]
 database.workspace = true
 
+[dev-dependencies]
+
+
 [features]
-default = ["std"]
+default = ["std", "serde"]
 std = [
 	"serde?/std",
 	"bytecode/std",
