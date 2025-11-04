@@ -438,25 +438,32 @@ fn execute_blocks_par(
             for chunk in indexed_txs.chunks(num_threads) {
                 let txs_sender = tx_sender.clone();
 
-                chunk.par_iter().for_each(|(index, tx)| {
-                    let (elapsed, bal) = measure!(
-                        false,
-                        format!("tx {index}"),
-                        handle_tx(
-                            block_env.clone(),
-                            block_hashes.clone(),
-                            bal_arc.clone(),
-                            cache.clone(),
-                            *index as u64,
-                            tx,
-                            debug,
-                        )
-                    );
+                // Parallel execution **only within this chunk**
+                let chunk_results: Vec<_> = chunk
+                    .par_iter()
+                    .map(|(index, tx)| {
+                        let (elapsed, bal) = measure!(
+                            false,
+                            format!("tx {index}"),
+                            handle_tx(
+                                block_env.clone(),
+                                block_hashes.clone(),
+                                bal_arc.clone(),
+                                cache.clone(),
+                                *index as u64,
+                                tx,
+                                debug,
+                            )
+                        );
+                        (*index as u64 + 1, bal, elapsed)
+                    })
+                    .collect();
 
-                    txs_sender
-                        .send((*index as u64 + 1, bal, elapsed))
-                        .expect("Failed to send result");
-                });
+                // Send results to main thread
+                for r in chunk_results {
+                    txs_sender.send(r).expect("Failed to send result");
+                }
+                // At this point, all txs in the chunk are done
             }
         });
 
