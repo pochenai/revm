@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     iter::zip,
     path::{self, PathBuf},
-    sync::Arc,
+    sync::{mpsc::channel, Arc},
     time::Duration,
 };
 
@@ -38,7 +38,7 @@ use revm::{
     SystemCallEvm,
 };
 
-use alloy_consensus::{EthereumTxEnvelope, TxEip4844};
+use alloy_consensus::{EthereumTxEnvelope, Transaction, TxEip4844};
 
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
@@ -81,18 +81,21 @@ pub static SYSTEM_CA_ADDRESSES: [Address; 5] = [
 /// Updated from 8192 to 8191 in <https://github.com/ethereum/EIPs/pull/9144>
 pub const HISTORY_SERVE_WINDOW: usize = 8191;
 
-/// Debug: validate bals and write input/output bals to bal-in.json and bal-out.json.
-const DEBUG: bool = true;
-
 /// `baltest` subcommand
 #[derive(Parser, Debug)]
 pub struct Cmd {
-    /// Run tests in multiple thread
-    #[arg(short = 't', short, default_value_t = 1)]
+    /// Run tests in multiple thread.
+    #[arg(short = 't', default_value_t = 1)]
     threads: usize,
-    /// Enable parallel execution by default (exe sequentially is the same as setting -t 1)
-    #[arg(short = 'p', short, default_value_t = true)]
+    /// Enable parallel execution by default (exe sequentially is the same as setting -t 1).
+    #[arg(short = 'p', default_value_t = true)]
     par: bool,
+    /// Process txs prioritized by gas limit.
+    #[arg(short = 'o', default_value_t = false)]
+    priority_by_gaslimit: bool,
+    /// Show debug info.
+    #[arg(short = 'd', default_value_t = false)]
+    debug: bool,
 }
 
 macro_rules! measure {
@@ -123,9 +126,17 @@ impl Cmd {
             true,
             task_name,
             if self.par {
-                execute_blocks_par(blocks, bals, caches, block_hashes, self.threads);
+                execute_blocks_par(
+                    blocks,
+                    bals,
+                    caches,
+                    block_hashes,
+                    self.threads,
+                    self.priority_by_gaslimit,
+                    self.debug,
+                );
             } else {
-                execute_blocks(blocks, bals, caches, block_hashes);
+                execute_blocks(blocks, bals, caches, block_hashes, self.debug);
             }
         );
 
@@ -211,6 +222,7 @@ fn execute_blocks(
     bals: Vec<Bal>,
     caches: Vec<CacheState>,
     block_hashes: BTreeMap<u64, B256>,
+    debug: bool,
 ) {
     for (index, (block, (mut bal, cache))) in zip(blocks, zip(bals, caches)).into_iter().enumerate()
     {
@@ -288,13 +300,14 @@ fn execute_blocks(
                 cache.clone(),
                 tx_index as u64,
                 tx,
+                debug,
             );
             results.push((tx_index as u64 + 1, changes));
         }
 
         // TODO: add post-tx bals
 
-        if DEBUG {
+        if debug {
             let mut output_bals = Bal::default();
             for (bal_index, bal) in results {
                 if let Some(bal) = bal {
@@ -322,7 +335,15 @@ fn handle_tx(
     cache: CacheState,
     tx_index: u64, // tx index start from 0, while the first tx's bal index is 1
     tx: &EthereumTxEnvelope<TxEip4844>,
+    debug: bool,
 ) -> Option<Bal> {
+    if debug {
+        println!(
+            "txindex:{:>3}, gaslimit:{:>8} start",
+            tx_index,
+            tx.gas_limit()
+        );
+    }
     let cached_state = State::builder()
         .with_block_hashes(block_hashes)
         .with_cached_prestate(cache)
@@ -370,6 +391,8 @@ fn execute_blocks_par(
     caches: Vec<CacheState>,
     block_hashes: BTreeMap<u64, B256>,
     num_threads: usize,
+    priority_by_gaslimit: bool,
+    debug: bool,
 ) {
     for (index, (block, (mut bal, cache))) in zip(blocks, zip(bals, caches)).into_iter().enumerate()
     {
@@ -393,18 +416,29 @@ fn execute_blocks_par(
         let parent_beacon_root = block.parent_beacon_block_root.unwrap();
         let body = block.into_body();
 
+        let mut indexed_txs: Vec<_> = body.transactions.into_iter().enumerate().collect();
+        if priority_by_gaslimit {
+            println!("priority_by_gaslimit");
+            measure!(
+                debug,
+                "sort_tx",
+                indexed_txs.sort_by_key(|(_, tx)| std::cmp::Reverse(tx.gas_limit()))
+            );
+        }
+
         // parallel execute txs
         let pool = ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .build()
             .expect("Failed to build Rayon pool");
 
+        let (tx_sender, rx_receiver) = channel::<(u64, Option<Bal>, Duration)>();
+
         pool.install(|| {
-            let results = body
-                .transactions
-                .par_iter()
-                .enumerate()
-                .map(|(index, tx)| -> (u64, Option<Bal>, Duration) {
+            for chunk in indexed_txs.chunks(num_threads) {
+                let txs_sender = tx_sender.clone();
+
+                chunk.par_iter().for_each(|(index, tx)| {
                     let (elapsed, bal) = measure!(
                         false,
                         format!("tx {index}"),
@@ -413,46 +447,57 @@ fn execute_blocks_par(
                             block_hashes.clone(),
                             bal_arc.clone(),
                             cache.clone(),
-                            index as u64,
+                            *index as u64,
                             tx,
+                            debug,
                         )
                     );
-                    (index as u64 + 1, bal, elapsed)
-                })
-                .collect::<Vec<(u64, Option<Bal>, Duration)>>();
 
-            if DEBUG {
-                let mut output_bals = Bal::default();
-                let mut max_elapsed = Duration::ZERO;
-                let mut max_elapsed_idx = 0;
-                for (bal_index, bal, elapsed) in results {
-                    if let Some(bal) = bal {
-                        output_bals.merge_bal(bal, bal_index);
-                    }
-                    if elapsed > max_elapsed {
-                        max_elapsed = elapsed;
-                        max_elapsed_idx = bal_index - 1;
-                    }
-                }
-                println!(
-                    "Block {} → tx #{} (0-based index) took the longest: {:?}",
-                    block_env.number, max_elapsed_idx, max_elapsed
-                );
-
-                // remove pre-tx and post-tx bals
-                bal.remove_first_last();
-                bal.remove_at_address(&SYSTEM_CA_ADDRESSES);
-                bal.accounts.sort_keys();
-
-                output_bals.accounts.sort_keys();
-                bal.accounts.sort_keys();
-                // assert_eq!(
-                //     output_bals, bal,
-                //     "bals for block {} is not equal",
-                //     block_env.number
-                // )
+                    txs_sender
+                        .send((*index as u64 + 1, bal, elapsed))
+                        .expect("Failed to send result");
+                });
             }
         });
+
+        // Drop the original sender so the iterator ends
+        drop(tx_sender);
+
+        // Collect all results from the channel
+        let mut results: Vec<_> = rx_receiver.into_iter().collect();
+
+        if debug {
+            let mut output_bals = Bal::default();
+            let mut max_elapsed = Duration::ZERO;
+            let mut max_elapsed_idx = 0;
+            results.sort_by_key(|(bal_index, _, _)| *bal_index);
+            for (bal_index, bal, elapsed) in results {
+                if let Some(bal) = bal {
+                    output_bals.merge_bal(bal, bal_index);
+                }
+                if elapsed > max_elapsed {
+                    max_elapsed = elapsed;
+                    max_elapsed_idx = bal_index - 1;
+                }
+            }
+            println!(
+                "Block {} → tx #{} (0-based index) took the longest: {:?}",
+                block_env.number, max_elapsed_idx, max_elapsed
+            );
+
+            // remove pre-tx and post-tx bals
+            bal.remove_first_last();
+            bal.remove_at_address(&SYSTEM_CA_ADDRESSES);
+            bal.accounts.sort_keys();
+
+            output_bals.accounts.sort_keys();
+            bal.accounts.sort_keys();
+            assert_eq!(
+                output_bals, bal,
+                "bals for block {} is not equal",
+                block_env.number
+            )
+        }
     }
 }
 
@@ -465,7 +510,7 @@ fn test_exe_blocks() {
 
     let caches = prestates_to_cachedbs(prestates);
 
-    execute_blocks(blocks, bals, caches, block_hashes);
+    execute_blocks(blocks, bals, caches, block_hashes, true);
 }
 
 #[test]
@@ -477,5 +522,5 @@ fn test_par_exe_blocks() {
     let block_hashes = import_struct(cwd.join("./data/blockHashes.json"));
 
     let caches = prestates_to_cachedbs(prestates);
-    execute_blocks_par(blocks, bals, caches, block_hashes, 5);
+    execute_blocks_par(blocks, bals, caches, block_hashes, 5, true, true);
 }
