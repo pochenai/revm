@@ -1,5 +1,6 @@
 //! This module contains [`block_state`] and how to import json data to rust structures for blocks, bals, block-hashes, pre-block states.
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::{any::Any, fs::File};
 use std::{fs, os};
 
@@ -37,7 +38,7 @@ pub struct PreblockState {
 }
 
 /// import blocks from json file
-pub fn import_struct<T: for<'a> Deserialize<'a>>(filename: &str) -> T {
+pub fn import_struct<T: for<'a> Deserialize<'a>, P: AsRef<Path>>(filename: P) -> T {
     let mut file = File::open(filename).unwrap();
     let mut contents = String::new();
     file.read_to_string(&mut contents).ok().unwrap();
@@ -160,35 +161,40 @@ mod tests {
     fn test_import_block() {
         // relative directory is the current crate root
         let filename = "../../bins/revme/data/blocks.json";
-        let blocks = import_struct::<Vec<RethBlock>>(filename);
+        let blocks: Vec<RethBlock> = import_struct(filename);
         println!("{:?}", blocks)
     }
 
     #[test]
     fn test_import_prestates() {
         let filename = "../../bins/revme/data/prestates.json";
-        let prestates = import_struct::<Vec<PreblockState>>(filename);
+        let prestates: Vec<PreblockState> = import_struct(filename);
         println!("{:?}", prestates)
     }
 
     #[test]
     fn test_import_bals() {
         let filename = "../../bins/revme/data/bals.json";
-        let mut bals = import_struct::<Vec<Bal>>(filename);
+        let mut bals: Vec<Bal> = import_struct(filename);
         // println!("{:?}", bals);
 
         let mut bal = bals.pop().unwrap();
-        let a1 = bal.accounts.get_key_value(&address!("0xd9105edf00a15807accf1158b0c04a5e118e4b80")).unwrap();
-        println!("{:?}",a1);
-        let a2 = bal.accounts.get_key_value(&address!("0xe3aF8532F6D4335dE2c6A0a3aD1cD290E87EE6AE")).unwrap();
-        println!("{:?}",a2);
-
+        let a1 = bal
+            .accounts
+            .get_key_value(&address!("0xd9105edf00a15807accf1158b0c04a5e118e4b80"))
+            .unwrap();
+        println!("{:?}", a1);
+        let a2 = bal
+            .accounts
+            .get_key_value(&address!("0xe3aF8532F6D4335dE2c6A0a3aD1cD290E87EE6AE"))
+            .unwrap();
+        println!("{:?}", a2);
     }
 
     #[test]
     fn test_import_blockhashes() {
         let filename = "../../bins/revme/data/blockHashes.json";
-        let blockhashes = import_struct::<BTreeMap<u64, B256>>(filename);
+        let blockhashes: BTreeMap<u64, B256> = import_struct(filename);
         println!("{:?}", blockhashes)
     }
 }

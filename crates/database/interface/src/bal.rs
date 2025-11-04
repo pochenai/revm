@@ -198,8 +198,6 @@ impl<DB: DatabaseCommit> DatabaseCommit for BalDatabase<DB> {
                 bal_builder.update_account(self.bal_index, *address, account);
             }
         }
-        // save changes in each transaction to facilate merge bal
-        self.changes = changes.clone();
         self.db.commit(changes);
     }
 }

@@ -152,13 +152,6 @@ impl Bal {
         }
     }
 
-    /// Extent BAL with each tx's changes
-    pub fn merge_changes(&mut self, changes: EvmState, bal_index: BalIndex) {
-        for (address, account) in changes.iter() {
-            self.update_account(bal_index, *address, account);
-        }
-    }
-
     /// Remove bals whose index is in idxs
     pub fn remove_at_ids(&mut self, idxs: Vec<BalIndex>) {
         if idxs.is_empty() {

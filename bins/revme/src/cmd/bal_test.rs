@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, iter::zip, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    iter::zip,
+    path::{self, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use alloy_primitives::{bytes, Bytes};
 use k256::elliptic_curve::consts::{False, True};
@@ -76,7 +82,7 @@ pub static SYSTEM_CA_ADDRESSES: [Address; 5] = [
 pub const HISTORY_SERVE_WINDOW: usize = 8191;
 
 /// Debug: validate bals and write input/output bals to bal-in.json and bal-out.json.
-const DEBUG: bool = false;
+const DEBUG: bool = true;
 
 /// `baltest` subcommand
 #[derive(Parser, Debug)]
@@ -290,16 +296,16 @@ fn execute_blocks(
 
         if DEBUG {
             let mut output_bals = Bal::default();
-            for (bal_index, changes) in results {
-                output_bals.merge_changes(changes, bal_index);
+            for (bal_index, bal) in results {
+                if let Some(bal) = bal {
+                    output_bals.merge_bal(bal, bal_index);
+                }
             }
             output_bals.accounts.sort_keys();
             // remove pre-tx and post-tx bals
             bal.remove_first_last();
             bal.remove_at_address(&SYSTEM_CA_ADDRESSES);
             bal.accounts.sort_keys();
-            write_data("bal-in.json", &bal);
-            write_data("bal-out.json", &output_bals);
             assert_eq!(
                 output_bals, bal,
                 "bals for tx {} in block {} is not equal",
@@ -316,7 +322,7 @@ fn handle_tx(
     cache: CacheState,
     tx_index: u64, // tx index start from 0, while the first tx's bal index is 1
     tx: &EthereumTxEnvelope<TxEip4844>,
-) -> HashMap<Address, Account> {
+) -> Option<Bal> {
     let cached_state = State::builder()
         .with_block_hashes(block_hashes)
         .with_cached_prestate(cache)
@@ -353,7 +359,7 @@ fn handle_tx(
     // must commit state changes, or bal builder will have nothing
     let result_state = exe_result.unwrap().state;
     evm.commit(result_state);
-    state.changes
+    state.bal_builder
     // print!("exe_result:{:?}", exe_result)
 }
 
@@ -398,31 +404,31 @@ fn execute_blocks_par(
                 .transactions
                 .par_iter()
                 .enumerate()
-                .map(
-                    |(index, tx)| -> (u64, HashMap<Address, Account>, Duration) {
-                        let (elapsed, changes) = measure!(
-                            false,
-                            format!("tx {index}"),
-                            handle_tx(
-                                block_env.clone(),
-                                block_hashes.clone(),
-                                bal_arc.clone(),
-                                cache.clone(),
-                                index as u64,
-                                tx,
-                            )
-                        );
-                        (index as u64 + 1, changes, elapsed)
-                    },
-                )
-                .collect::<Vec<(u64, HashMap<Address, Account>, Duration)>>();
+                .map(|(index, tx)| -> (u64, Option<Bal>, Duration) {
+                    let (elapsed, bal) = measure!(
+                        false,
+                        format!("tx {index}"),
+                        handle_tx(
+                            block_env.clone(),
+                            block_hashes.clone(),
+                            bal_arc.clone(),
+                            cache.clone(),
+                            index as u64,
+                            tx,
+                        )
+                    );
+                    (index as u64 + 1, bal, elapsed)
+                })
+                .collect::<Vec<(u64, Option<Bal>, Duration)>>();
 
             if DEBUG {
                 let mut output_bals = Bal::default();
                 let mut max_elapsed = Duration::ZERO;
                 let mut max_elapsed_idx = 0;
-                for (bal_index, changes, elapsed) in results {
-                    output_bals.merge_changes(changes, bal_index);
+                for (bal_index, bal, elapsed) in results {
+                    if let Some(bal) = bal {
+                        output_bals.merge_bal(bal, bal_index);
+                    }
                     if elapsed > max_elapsed {
                         max_elapsed = elapsed;
                         max_elapsed_idx = bal_index - 1;
@@ -432,6 +438,12 @@ fn execute_blocks_par(
                     "Block {} → tx #{} (0-based index) took the longest: {:?}",
                     block_env.number, max_elapsed_idx, max_elapsed
                 );
+
+                // remove pre-tx and post-tx bals
+                bal.remove_first_last();
+                bal.remove_at_address(&SYSTEM_CA_ADDRESSES);
+                bal.accounts.sort_keys();
+
                 output_bals.accounts.sort_keys();
                 bal.accounts.sort_keys();
                 // assert_eq!(
@@ -458,10 +470,11 @@ fn test_exe_blocks() {
 
 #[test]
 fn test_par_exe_blocks() {
-    let blocks = import_struct("./data/blocks.json");
-    let bals: Vec<Bal> = import_struct("./data/src/bals.json");
-    let prestates = import_struct("./data/prestates.json");
-    let block_hashes = import_struct("./data/blockHashes.json");
+    let cwd = std::env::current_dir().unwrap();
+    let blocks = import_struct(cwd.join("./data/blocks.json"));
+    let bals: Vec<Bal> = import_struct(cwd.join("./data/bals.json"));
+    let prestates = import_struct(cwd.join("./data/prestates.json"));
+    let block_hashes = import_struct(cwd.join("./data/blockHashes.json"));
 
     let caches = prestates_to_cachedbs(prestates);
     execute_blocks_par(blocks, bals, caches, block_hashes, 5);
