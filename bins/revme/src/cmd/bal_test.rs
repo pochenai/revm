@@ -6,6 +6,8 @@ use std::{
     time::Duration,
 };
 
+use crossbeam::channel::{unbounded, Receiver, Sender};
+
 use alloy_primitives::{bytes, Bytes};
 use k256::elliptic_curve::consts::{False, True};
 use revm::{
@@ -426,52 +428,51 @@ fn execute_blocks_par(
             );
         }
 
-        // parallel execute txs
+        // Work channel
+        let (task_sender, task_receiver) = unbounded();
+        for task in indexed_txs.into_iter() {
+            task_sender.send(task).unwrap();
+        }
+        drop(task_sender); // close sender so workers know when finished
+
+        // Result channel
+        let (res_sender, res_receiver) = unbounded();
+
+        // Build thread pool
         let pool = ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .build()
             .expect("Failed to build Rayon pool");
 
-        let (tx_sender, rx_receiver) = channel::<(u64, Option<Bal>, Duration)>();
-
         pool.install(|| {
-            for chunk in indexed_txs.chunks(num_threads) {
-                let txs_sender = tx_sender.clone();
+            (0..num_threads).into_par_iter().for_each(|_| {
+                // let task_receiver = task_receiver.iter().cloned();
+                while let Ok((index, tx)) = task_receiver.try_recv() {
+                    let (elapsed, bal) = measure!(
+                        false,
+                        format!("tx {}", index),
+                        handle_tx(
+                            block_env.clone(),
+                            block_hashes.clone(),
+                            bal_arc.clone(),
+                            cache.clone(),
+                            index as u64,
+                            &tx,
+                            debug
+                        )
+                    );
 
-                // Parallel execution **only within this chunk**
-                let chunk_results: Vec<_> = chunk
-                    .par_iter()
-                    .map(|(index, tx)| {
-                        let (elapsed, bal) = measure!(
-                            false,
-                            format!("tx {index}"),
-                            handle_tx(
-                                block_env.clone(),
-                                block_hashes.clone(),
-                                bal_arc.clone(),
-                                cache.clone(),
-                                *index as u64,
-                                tx,
-                                debug,
-                            )
-                        );
-                        (*index as u64 + 1, bal, elapsed)
-                    })
-                    .collect();
-
-                // Send results to main thread
-                for r in chunk_results {
-                    txs_sender.send(r).expect("Failed to send result");
+                    res_sender
+                        .send((index as u64 + 1, bal, elapsed))
+                        .expect("Failed to send result");
                 }
-                // At this point, all txs in the chunk are done
-            }
+            });
         });
 
-        // Drop the original sender so the iterator ends
-        drop(tx_sender);
-
+        // Drop the last res_sender to close the channel
+        drop(res_sender);
         // Collect all results from the channel
-        let mut results: Vec<_> = rx_receiver.into_iter().collect();
+        let mut results: Vec<_> = res_receiver.into_iter().collect();
 
         if debug {
             let mut output_bals = Bal::default();
