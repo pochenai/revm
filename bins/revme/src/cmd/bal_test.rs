@@ -529,12 +529,14 @@ fn execute_blocks_par(
                     }
                 }
                 // remove pre-tx and post-tx bals
+                output_bals.remove_at_address(&SYSTEM_CA_ADDRESSES);
+                output_bals.accounts.sort_keys();
+
                 bal.remove_first_last();
                 bal.remove_at_address(&SYSTEM_CA_ADDRESSES);
                 bal.accounts.sort_keys();
 
                 output_bals.accounts.sort_keys();
-                bal.accounts.sort_keys();
                 if output_bals != bal {
                     write_data("bals-in.json", &bal);
                     write_data("bals-out.json", &output_bals);
