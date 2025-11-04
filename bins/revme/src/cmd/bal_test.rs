@@ -45,7 +45,7 @@ use alloy_consensus::{EthereumTxEnvelope, Transaction, TxEip4844};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::time::Instant;
 
 pub const SYSTEM_ADDRESS: Address = address!("0xfffffffffffffffffffffffffffffffffffffffe");
@@ -92,12 +92,24 @@ pub struct Cmd {
     /// Enable parallel execution by default (exe sequentially is the same as setting -t 1).
     #[arg(short = 'p', default_value_t = true)]
     par: bool,
-    /// Process txs prioritized by gas limit.
-    #[arg(short = 'o', default_value_t = false)]
-    priority_by_gaslimit: bool,
+    /// Process txs prioritized by gas limit order.
+    #[arg(short = 'o', value_enum, default_value = "do")]
+    priority_by_gaslimit: PriorityOrder,
     /// Show debug info.
     #[arg(short = 'd', default_value_t = false)]
     debug: bool,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum PriorityOrder {
+    /// Sort transactions by ascending gas limit.
+    #[clap(alias = "ao")]
+    Ascending,
+    /// Sort transactions by descending gas limit.
+    #[clap(alias = "do")]
+    Descending,
+    /// Do not sort by gas limit.
+    None,
 }
 
 macro_rules! measure {
@@ -393,7 +405,7 @@ fn execute_blocks_par(
     caches: Vec<CacheState>,
     block_hashes: BTreeMap<u64, B256>,
     num_threads: usize,
-    priority_by_gaslimit: bool,
+    priority_by_gaslimit: PriorityOrder,
     debug: bool,
 ) {
     for (index, (block, (mut bal, cache))) in zip(blocks, zip(bals, caches)).into_iter().enumerate()
@@ -419,18 +431,28 @@ fn execute_blocks_par(
         let body = block.into_body();
 
         let mut indexed_txs: Vec<_> = body.transactions.into_iter().enumerate().collect();
-        if priority_by_gaslimit {
-            println!("priority_by_gaslimit");
-            measure!(
-                debug,
-                "sort_tx",
-                indexed_txs.sort_by_key(|(_, tx)| std::cmp::Reverse(tx.gas_limit()))
-            );
+
+        match priority_by_gaslimit {
+            PriorityOrder::Ascending => {
+                measure!(
+                    debug,
+                    "sort_tx_ascending",
+                    indexed_txs.sort_by_key(|(_, tx)| tx.gas_limit())
+                );
+            }
+            PriorityOrder::Descending => {
+                measure!(
+                    debug,
+                    "sort_tx_descending",
+                    indexed_txs.sort_by_key(|(_, tx)| std::cmp::Reverse(tx.gas_limit()))
+                );
+            }
+            PriorityOrder::None => { /* no sort */ }
         }
 
         // Work channel
         let (task_sender, task_receiver) = unbounded();
-        for task in indexed_txs.into_iter() {
+        for task in indexed_txs.iter() {
             task_sender.send(task).unwrap();
         }
         drop(task_sender); // close sender so workers know when finished
@@ -447,7 +469,7 @@ fn execute_blocks_par(
         pool.install(|| {
             (0..num_threads).into_par_iter().for_each(|_| {
                 // let task_receiver = task_receiver.iter().cloned();
-                while let Ok((index, tx)) = task_receiver.try_recv() {
+                while let Ok((index, tx)) = task_receiver.recv() {
                     let (elapsed, bal) = measure!(
                         false,
                         format!("tx {}", index),
@@ -456,14 +478,14 @@ fn execute_blocks_par(
                             block_hashes.clone(),
                             bal_arc.clone(),
                             cache.clone(),
-                            index as u64,
-                            &tx,
+                            *index as u64,
+                            tx,
                             debug
                         )
                     );
 
                     res_sender
-                        .send((index as u64 + 1, bal, elapsed))
+                        .send((*index as u64 + 1, bal, elapsed))
                         .expect("Failed to send result");
                 }
             });
@@ -530,5 +552,5 @@ fn test_par_exe_blocks() {
     let block_hashes = import_struct(cwd.join("./data/blockHashes.json"));
 
     let caches = prestates_to_cachedbs(prestates);
-    execute_blocks_par(blocks, bals, caches, block_hashes, 5, true, true);
+    execute_blocks_par(blocks, bals, caches, block_hashes, 5, PriorityOrder::Descending, true);
 }
