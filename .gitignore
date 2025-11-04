@@ -29,6 +29,6 @@ rustc-ice-*
 
 # blocks, bals, pre-block states, blockHashes
 *.json
-log.txt
+*.txt
 # don't ignore in-memory state for others to reproduce
-!bins/revme/data/*  
+!bins/revme/data/*_1.json  

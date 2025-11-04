@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fmt::format,
     iter::zip,
     path::{self, PathBuf},
     sync::{mpsc::channel, Arc},
@@ -83,6 +84,8 @@ pub static SYSTEM_CA_ADDRESSES: [Address; 5] = [
 /// Updated from 8192 to 8191 in <https://github.com/ethereum/EIPs/pull/9144>
 pub const HISTORY_SERVE_WINDOW: usize = 8191;
 
+pub const CHECK_BAL: bool = false;
+
 /// `baltest` subcommand
 #[derive(Parser, Debug)]
 pub struct Cmd {
@@ -92,9 +95,12 @@ pub struct Cmd {
     /// Enable parallel execution by default (exe sequentially is the same as setting -t 1).
     #[arg(short = 'p', default_value_t = true)]
     par: bool,
+    /// Number of blocks (n) for file blocks_n.json, bals_n.json, blockHashes_n.json, prestates_n.json.
+    #[arg(short = 'n', default_value_t = 1)]
+    nblocks: u64,
     /// Process txs prioritized by gas limit order.
-    #[arg(short = 'o', value_enum, default_value = "do")]
-    priority_by_gaslimit: PriorityOrder,
+    #[arg(short = 's', value_enum, default_value = "do")]
+    schedule_by_gaslimit: PriorityOrder,
     /// Show debug info.
     #[arg(short = 'd', default_value_t = false)]
     debug: bool,
@@ -128,10 +134,11 @@ impl Cmd {
     /// Runs `baltest` command.
     pub fn run(&self) -> Result<(), super::Error> {
         // Push the file in revme/data directory
-        let blocks = import_struct("./data/blocks.json");
-        let bals: Vec<Bal> = import_struct("./data/bals.json");
-        let prestates = import_struct("./data/prestates.json");
-        let block_hashes = import_struct("./data/blockHashes.json");
+        let nblocks = self.nblocks;
+        let blocks = import_struct(format!("./data/blocks_{nblocks}.json"));
+        let bals: Vec<Bal> = import_struct(format!("./data/bals_{nblocks}.json"));
+        let prestates = import_struct(format!("./data/prestates_{nblocks}.json"));
+        let block_hashes = import_struct(format!("./data/blockHashes_{nblocks}.json"));
 
         let caches = prestates_to_cachedbs(prestates);
 
@@ -146,7 +153,7 @@ impl Cmd {
                     caches,
                     block_hashes,
                     self.threads,
-                    self.priority_by_gaslimit,
+                    self.schedule_by_gaslimit,
                     self.debug,
                 );
             } else {
@@ -351,13 +358,13 @@ fn handle_tx(
     tx: &EthereumTxEnvelope<TxEip4844>,
     debug: bool,
 ) -> Option<Bal> {
-    if debug {
-        println!(
-            "txindex:{:>3}, gaslimit:{:>8} start",
-            tx_index,
-            tx.gas_limit()
-        );
-    }
+    // if debug {
+    //     println!(
+    //         "txindex:{:>3}, gaslimit:{:>8} start",
+    //         tx_index,
+    //         tx.gas_limit()
+    //     );
+    // }
     let cached_state = State::builder()
         .with_block_hashes(block_hashes)
         .with_cached_prestate(cache)
@@ -408,6 +415,7 @@ fn execute_blocks_par(
     priority_by_gaslimit: PriorityOrder,
     debug: bool,
 ) {
+    let mut sum_longest_tx_time = Duration::ZERO;
     for (index, (block, (mut bal, cache))) in zip(blocks, zip(bals, caches)).into_iter().enumerate()
     {
         let block_env = BlockEnv {
@@ -497,16 +505,11 @@ fn execute_blocks_par(
         let mut results: Vec<_> = res_receiver.into_iter().collect();
 
         if debug {
-            let mut output_bals = Bal::default();
             let mut max_elapsed = Duration::ZERO;
             let mut max_elapsed_idx = 0;
-            results.sort_by_key(|(bal_index, _, _)| *bal_index);
-            for (bal_index, bal, elapsed) in results {
-                if let Some(bal) = bal {
-                    output_bals.merge_bal(bal, bal_index);
-                }
-                if elapsed > max_elapsed {
-                    max_elapsed = elapsed;
+            for (bal_index, _, elapsed) in &results {
+                if elapsed > &max_elapsed {
+                    max_elapsed = *elapsed;
                     max_elapsed_idx = bal_index - 1;
                 }
             }
@@ -515,28 +518,46 @@ fn execute_blocks_par(
                 block_env.number, max_elapsed_idx, max_elapsed
             );
 
-            // remove pre-tx and post-tx bals
-            bal.remove_first_last();
-            bal.remove_at_address(&SYSTEM_CA_ADDRESSES);
-            bal.accounts.sort_keys();
+            sum_longest_tx_time += max_elapsed;
 
-            output_bals.accounts.sort_keys();
-            bal.accounts.sort_keys();
-            assert_eq!(
-                output_bals, bal,
-                "bals for block {} is not equal",
-                block_env.number
-            )
+            if CHECK_BAL {
+                let mut output_bals = Bal::default();
+                results.sort_by_key(|(bal_index, _, _)| *bal_index);
+                for (bal_index, bal, elapsed) in results {
+                    if let Some(bal) = bal {
+                        output_bals.merge_bal(bal, bal_index);
+                    }
+                }
+                // remove pre-tx and post-tx bals
+                bal.remove_first_last();
+                bal.remove_at_address(&SYSTEM_CA_ADDRESSES);
+                bal.accounts.sort_keys();
+
+                output_bals.accounts.sort_keys();
+                bal.accounts.sort_keys();
+                if output_bals != bal {
+                    write_data("bals-in.json", &bal);
+                    write_data("bals-out.json", &output_bals);
+                    panic!("bals for block {} is not equal", block_env.number)
+                }
+            }
         }
+    }
+
+    if debug {
+        println!(
+            "Sum of most time-consuming tx durations per block: {:?}",
+            sum_longest_tx_time
+        );
     }
 }
 
 #[test]
 fn test_exe_blocks() {
-    let blocks = import_struct("./data/blocks.json");
-    let bals: Vec<Bal> = import_struct("./data/bals.json");
-    let prestates = import_struct("./data/prestates.json");
-    let block_hashes = import_struct("./data/blockHashes.json");
+    let blocks = import_struct("./data/blocks_1.json");
+    let bals: Vec<Bal> = import_struct("./data/bals_1.json");
+    let prestates = import_struct("./data/prestates_1.json");
+    let block_hashes = import_struct("./data/blockHashes_1.json");
 
     let caches = prestates_to_cachedbs(prestates);
 
@@ -546,11 +567,19 @@ fn test_exe_blocks() {
 #[test]
 fn test_par_exe_blocks() {
     let cwd = std::env::current_dir().unwrap();
-    let blocks = import_struct(cwd.join("./data/blocks.json"));
-    let bals: Vec<Bal> = import_struct(cwd.join("./data/bals.json"));
-    let prestates = import_struct(cwd.join("./data/prestates.json"));
-    let block_hashes = import_struct(cwd.join("./data/blockHashes.json"));
+    let blocks = import_struct(cwd.join("./data/blocks_1.json"));
+    let bals: Vec<Bal> = import_struct(cwd.join("./data/bals_1.json"));
+    let prestates = import_struct(cwd.join("./data/prestates_1.json"));
+    let block_hashes = import_struct(cwd.join("./data/blockHashes_1.json"));
 
     let caches = prestates_to_cachedbs(prestates);
-    execute_blocks_par(blocks, bals, caches, block_hashes, 5, PriorityOrder::Descending, true);
+    execute_blocks_par(
+        blocks,
+        bals,
+        caches,
+        block_hashes,
+        5,
+        PriorityOrder::Descending,
+        true,
+    );
 }

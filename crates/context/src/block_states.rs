@@ -160,21 +160,21 @@ mod tests {
     #[test]
     fn test_import_block() {
         // relative directory is the current crate root
-        let filename = "../../bins/revme/data/blocks.json";
+        let filename = "../../bins/revme/data/blocks_1.json";
         let blocks: Vec<RethBlock> = import_struct(filename);
         println!("{:?}", blocks)
     }
 
     #[test]
     fn test_import_prestates() {
-        let filename = "../../bins/revme/data/prestates.json";
+        let filename = "../../bins/revme/data/prestates_1.json";
         let prestates: Vec<PreblockState> = import_struct(filename);
         println!("{:?}", prestates)
     }
 
     #[test]
     fn test_import_bals() {
-        let filename = "../../bins/revme/data/bals.json";
+        let filename = "../../bins/revme/data/bals_1.json";
         let mut bals: Vec<Bal> = import_struct(filename);
         // println!("{:?}", bals);
 
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn test_import_blockhashes() {
-        let filename = "../../bins/revme/data/blockHashes.json";
+        let filename = "../../bins/revme/data/blockHashes_1.json";
         let blockhashes: BTreeMap<u64, B256> = import_struct(filename);
         println!("{:?}", blockhashes)
     }
