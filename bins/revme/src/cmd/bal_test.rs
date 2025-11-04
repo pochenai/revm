@@ -98,12 +98,15 @@ pub struct Cmd {
     /// Number of blocks (n) for file blocks_n.json, bals_n.json, blockHashes_n.json, prestates_n.json.
     #[arg(short = 'n', default_value_t = 1)]
     nblocks: u64,
-    /// Process txs prioritized by gas limit order.
+    /// Process txs prioritized by gas limit order, "do":descending, "ao": ascending, "none": random shedule.
     #[arg(short = 's', value_enum, default_value = "do")]
     schedule_by_gaslimit: PriorityOrder,
-    /// Show debug info.
+    /// Enable showing debug info.
     #[arg(short = 'd', default_value_t = false)]
     debug: bool,
+    /// Enable checking the re-execute generated bals is the same with input bals.
+    #[arg(short = 'c', default_value_t = false)]
+    check_bal: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -147,15 +150,7 @@ impl Cmd {
             true,
             task_name,
             if self.par {
-                execute_blocks_par(
-                    blocks,
-                    bals,
-                    caches,
-                    block_hashes,
-                    self.threads,
-                    self.schedule_by_gaslimit,
-                    self.debug,
-                );
+                execute_blocks_par(blocks, bals, caches, block_hashes, self);
             } else {
                 execute_blocks(blocks, bals, caches, block_hashes, self.debug);
             }
@@ -411,11 +406,10 @@ fn execute_blocks_par(
     bals: Vec<Bal>,
     caches: Vec<CacheState>,
     block_hashes: BTreeMap<u64, B256>,
-    num_threads: usize,
-    priority_by_gaslimit: PriorityOrder,
-    debug: bool,
+    cmd_env: &Cmd,
 ) {
     let mut sum_longest_tx_time = Duration::ZERO;
+    let debug = cmd_env.debug;
     for (index, (block, (mut bal, cache))) in zip(blocks, zip(bals, caches)).into_iter().enumerate()
     {
         let block_env = BlockEnv {
@@ -440,7 +434,7 @@ fn execute_blocks_par(
 
         let mut indexed_txs: Vec<_> = body.transactions.into_iter().enumerate().collect();
 
-        match priority_by_gaslimit {
+        match cmd_env.schedule_by_gaslimit {
             PriorityOrder::Ascending => {
                 measure!(
                     debug,
@@ -470,12 +464,12 @@ fn execute_blocks_par(
 
         // Build thread pool
         let pool = ThreadPoolBuilder::new()
-            .num_threads(num_threads)
+            .num_threads(cmd_env.threads)
             .build()
             .expect("Failed to build Rayon pool");
 
         pool.install(|| {
-            (0..num_threads).into_par_iter().for_each(|_| {
+            (0..cmd_env.threads).into_par_iter().for_each(|_| {
                 // let task_receiver = task_receiver.iter().cloned();
                 while let Ok((index, tx)) = task_receiver.recv() {
                     let (elapsed, bal) = measure!(
@@ -520,7 +514,7 @@ fn execute_blocks_par(
 
             sum_longest_tx_time += max_elapsed;
 
-            if CHECK_BAL {
+            if cmd_env.check_bal {
                 let mut output_bals = Bal::default();
                 results.sort_by_key(|(bal_index, _, _)| *bal_index);
                 for (bal_index, bal, elapsed) in results {
