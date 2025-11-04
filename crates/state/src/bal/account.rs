@@ -47,6 +47,13 @@ impl AccountBal {
         self.account_info.populate_account_info(bal_index, account)
     }
 
+    /// Merge another bal into the current bal
+    pub fn merge_account_bal(&mut self, other: AccountBal, bal_index: BalIndex) {
+        self.account_info
+            .merge_account_info_bal(other.account_info, bal_index);
+        self.storage.merge_storage_bal(other.storage, bal_index);
+    }
+
     /// Extend account from another account.
     #[inline]
     pub fn update(&mut self, bal_index: BalIndex, account: &Account) {
@@ -173,6 +180,12 @@ impl AccountInfoBal {
         changed
     }
 
+    fn merge_account_info_bal(&mut self, other: AccountInfoBal, bal_index: BalIndex) {
+        self.nonce.merge_writes(other.nonce, bal_index);
+        self.balance.merge_writes(other.balance, bal_index);
+        self.code.merge_writes(other.code, bal_index);
+    }
+
     /// Extend account info from another account info.
     #[inline]
     pub fn update(&mut self, index: BalIndex, original: &AccountInfo, present: &AccountInfo) {
@@ -255,6 +268,15 @@ impl StorageBal {
                     entry.insert(value);
                 }
             }
+        }
+    }
+
+    fn merge_storage_bal(&mut self, other: StorageBal, bal_index: BalIndex) {
+        for (key, other_writes) in other.storage {
+            self.storage
+                .entry(key)
+                .or_insert_with(|| BalWrites { writes: vec![] })
+                .merge_writes(other_writes, bal_index);
         }
     }
 

@@ -24,7 +24,10 @@ use revm::{
         address, alloy_primitives, hardfork::SpecId, hex::FromHex, Address, HashMap, B256,
         KECCAK_EMPTY, U256,
     },
-    state::{bal::Bal, Account, AccountInfo, Bytecode},
+    state::{
+        bal::{Bal, BalWrites},
+        Account, AccountInfo, Bytecode,
+    },
     Context, Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
     SystemCallEvm,
 };
@@ -37,10 +40,10 @@ use rayon::ThreadPoolBuilder;
 use clap::Parser;
 use std::time::Instant;
 
-pub const SYSTEM_ADDRESS: Address = address!("fffffffffffffffffffffffffffffffffffffffe");
+pub const SYSTEM_ADDRESS: Address = address!("0xfffffffffffffffffffffffffffffffffffffffe");
 
 /// The address for the EIP-4788 beacon roots contract.
-pub const BEACON_ROOTS_ADDRESS: Address = address!("000F3df6D732807Ef1319fB7B8bB8522d0Beac02");
+pub const BEACON_ROOTS_ADDRESS: Address = address!("0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02");
 
 /// The code for the EIP-4788 beacon roots contract.
 pub static BEACON_ROOTS_CODE: Bytes = bytes!("3373fffffffffffffffffffffffffffffffffffffffe14604d57602036146024575f5ffd5b5f35801560495762001fff810690815414603c575f5ffd5b62001fff01545f5260205ff35b5f5ffd5b62001fff42064281555f359062001fff015500");
@@ -50,6 +53,18 @@ pub const HISTORY_STORAGE_ADDRESS: Address = address!("0x0000F90827F1C53a10cb7A0
 
 /// The code for the EIP-2935 history storage contract.
 pub static HISTORY_STORAGE_CODE: Bytes = bytes!("3373fffffffffffffffffffffffffffffffffffffffe14604657602036036042575f35600143038111604257611fff81430311604257611fff9006545f5260205ff35b5f5ffd5b5f35611fff60014303065500");
+
+pub const WITHDRAW_QUEUE_ADDRESS: Address = address!("0x00000961Ef480Eb55e80D19ad83579A64c007002");
+pub const CONSPLICATION_QUEUE_ADDRESS: Address =
+    address!("0x0000BBdDc7CE488642fb579F8B00f3a590007251");
+
+pub static SYSTEM_CA_ADDRESSES: [Address; 5] = [
+    SYSTEM_ADDRESS,
+    BEACON_ROOTS_ADDRESS,
+    HISTORY_STORAGE_ADDRESS,
+    WITHDRAW_QUEUE_ADDRESS,
+    CONSPLICATION_QUEUE_ADDRESS,
+];
 
 /// EIP-2935: Serve historical block hashes from state
 ///
@@ -61,9 +76,9 @@ pub static HISTORY_STORAGE_CODE: Bytes = bytes!("3373fffffffffffffffffffffffffff
 pub const HISTORY_SERVE_WINDOW: usize = 8191;
 
 /// Debug: validate bals and write input/output bals to bal-in.json and bal-out.json.
-const DEBUG: bool = true;
+const DEBUG: bool = false;
 
-/// `statetest` subcommand
+/// `baltest` subcommand
 #[derive(Parser, Debug)]
 pub struct Cmd {
     /// Run tests in multiple thread
@@ -87,7 +102,7 @@ macro_rules! measure {
 }
 
 impl Cmd {
-    /// Runs `statetest` command.
+    /// Runs `baltest` command.
     pub fn run(&self) -> Result<(), super::Error> {
         // Push the file in revme/data directory
         let blocks = import_struct("./data/blocks.json");
@@ -276,11 +291,12 @@ fn execute_blocks(
         if DEBUG {
             let mut output_bals = Bal::default();
             for (bal_index, changes) in results {
-                output_bals.merge_bal(changes, bal_index);
+                output_bals.merge_changes(changes, bal_index);
             }
             output_bals.accounts.sort_keys();
             // remove pre-tx and post-tx bals
             bal.remove_first_last();
+            bal.remove_at_address(&SYSTEM_CA_ADDRESSES);
             bal.accounts.sort_keys();
             write_data("bal-in.json", &bal);
             write_data("bal-out.json", &output_bals);
@@ -406,7 +422,7 @@ fn execute_blocks_par(
                 let mut max_elapsed = Duration::ZERO;
                 let mut max_elapsed_idx = 0;
                 for (bal_index, changes, elapsed) in results {
-                    output_bals.merge_bal(changes, bal_index);
+                    output_bals.merge_changes(changes, bal_index);
                     if elapsed > max_elapsed {
                         max_elapsed = elapsed;
                         max_elapsed_idx = bal_index - 1;

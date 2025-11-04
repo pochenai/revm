@@ -16,14 +16,14 @@ pub mod account;
 pub mod alloy;
 pub mod writes;
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 pub use account::{AccountBal, AccountInfoBal, StorageBal};
 pub use writes::BalWrites;
 
 use crate::{Account, AccountInfo, EvmState};
 use alloy_eip7928::BlockAccessList as AlloyBal;
-use primitives::{Address, HashSet, IndexMap, StorageKey, StorageValue};
+use primitives::{address, Address, HashSet, IndexMap, StorageKey, StorageValue};
 
 /// Block access index (0 for pre-execution, 1..n for transactions, n+1 for post-execution)
 pub type BalIndex = u64;
@@ -134,8 +134,26 @@ impl Bal {
         bal_account.update(bal_index, account);
     }
 
+    /// Merge another Bal into self at the given bal_index.
+    pub fn merge_bal(&mut self, other: Bal, bal_index: BalIndex) {
+        for (addr, other_account) in other.accounts {
+            let account = self.accounts.entry(addr).or_insert_with(|| AccountBal {
+                account_info: AccountInfoBal {
+                    nonce: BalWrites { writes: vec![] },
+                    balance: BalWrites { writes: vec![] },
+                    code: BalWrites { writes: vec![] },
+                },
+                storage: StorageBal {
+                    storage: BTreeMap::new(),
+                },
+            });
+
+            account.merge_account_bal(other_account, bal_index);
+        }
+    }
+
     /// Extent BAL with each tx's changes
-    pub fn merge_bal(&mut self, changes: EvmState, bal_index: BalIndex) {
+    pub fn merge_changes(&mut self, changes: EvmState, bal_index: BalIndex) {
         for (address, account) in changes.iter() {
             self.update_account(bal_index, *address, account);
         }
@@ -178,6 +196,13 @@ impl Bal {
     pub fn remove_first_last(&mut self) {
         let idxs = vec![0, self.accounts.len() as u64 + 1];
         self.remove_at_ids(idxs);
+    }
+
+    /// remove system contracts bals
+    pub fn remove_at_address(&mut self, addrs: &[Address]) {
+        for addr in addrs {
+            self.accounts.shift_remove(addr);
+        }
     }
 
     /// Populate account from BAL. Return true if account info got changed
@@ -354,5 +379,88 @@ impl core::fmt::Display for BalError {
             Self::AccountNotFound => write!(f, "Account not found in BAL"),
             Self::SlotNotFound => write!(f, "Slot not found in BAL"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use primitives::U256;
+
+    use super::*;
+
+    #[test]
+    fn test_merge_bal() {
+        let mut bal1 = Bal {
+            accounts: IndexMap::new(),
+        };
+
+        // Bal #1 with one account
+        let addr1 = address!("0x0000000000000000000000000000000000000001");
+        bal1.accounts.insert(
+            addr1,
+            AccountBal {
+                account_info: AccountInfoBal {
+                    nonce: BalWrites {
+                        writes: vec![(1, 10)],
+                    },
+                    balance: BalWrites {
+                        writes: vec![(1, U256::from(100))],
+                    },
+                    code: BalWrites { writes: vec![] },
+                },
+                storage: StorageBal {
+                    storage: BTreeMap::from([(
+                        StorageKey::from(0),
+                        BalWrites {
+                            writes: vec![(1, StorageValue::from(123))],
+                        },
+                    )]),
+                },
+            },
+        );
+
+        // Bal #2 with same account, different values
+        let mut bal2 = Bal {
+            accounts: IndexMap::new(),
+        };
+        bal2.accounts.insert(
+            addr1,
+            AccountBal {
+                account_info: AccountInfoBal {
+                    nonce: BalWrites {
+                        writes: vec![(2, 11)],
+                    },
+                    balance: BalWrites {
+                        writes: vec![(2, U256::from(200))],
+                    },
+                    code: BalWrites { writes: vec![] },
+                },
+                storage: StorageBal {
+                    storage: BTreeMap::from([(
+                        StorageKey::from(0),
+                        BalWrites {
+                            writes: vec![(2, StorageValue::from(456))],
+                        },
+                    )]),
+                },
+            },
+        );
+
+        // Merge bal2 into bal1 at bal_index = 2
+        bal1.merge_bal(bal2, 2);
+
+        let acc = &bal1.accounts[&addr1];
+        assert_eq!(
+            acc.account_info.nonce.writes.as_slice(),
+            vec![(1, 10), (2, 11)].as_slice()
+        );
+        assert_eq!(
+            acc.account_info.balance.writes.as_slice(),
+            vec![(1, U256::from(100)), (2, U256::from(200))].as_slice()
+        );
+        assert_eq!(
+            acc.storage.storage[&StorageKey::from(0)].writes.as_slice(),
+            vec![(1, StorageValue::from(123)), (2, StorageValue::from(456))].as_slice()
+        );
     }
 }

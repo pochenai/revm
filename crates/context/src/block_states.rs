@@ -151,6 +151,7 @@ pub fn write_data<T: Serialize>(filename: &str, data: &T) {
 mod tests {
     use std::collections::BTreeMap;
 
+    use primitives::address;
     use state::bal::Bal;
 
     use super::*;
@@ -173,8 +174,15 @@ mod tests {
     #[test]
     fn test_import_bals() {
         let filename = "../../bins/revme/data/bals.json";
-        let bals = import_struct::<Vec<Bal>>(filename);
-        println!("{:?}", bals)
+        let mut bals = import_struct::<Vec<Bal>>(filename);
+        // println!("{:?}", bals);
+
+        let mut bal = bals.pop().unwrap();
+        let a1 = bal.accounts.get_key_value(&address!("0xd9105edf00a15807accf1158b0c04a5e118e4b80")).unwrap();
+        println!("{:?}",a1);
+        let a2 = bal.accounts.get_key_value(&address!("0xe3aF8532F6D4335dE2c6A0a3aD1cD290E87EE6AE")).unwrap();
+        println!("{:?}",a2);
+
     }
 
     #[test]
