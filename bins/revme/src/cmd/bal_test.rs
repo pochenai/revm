@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    default,
     fmt::format,
     iter::zip,
     path::{self, PathBuf},
@@ -84,10 +85,8 @@ pub static SYSTEM_CA_ADDRESSES: [Address; 5] = [
 /// Updated from 8192 to 8191 in <https://github.com/ethereum/EIPs/pull/9144>
 pub const HISTORY_SERVE_WINDOW: usize = 8191;
 
-pub const CHECK_BAL: bool = false;
-
 /// `baltest` subcommand
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Default)]
 pub struct Cmd {
     /// Run tests in multiple thread.
     #[arg(short = 't', default_value_t = 1)]
@@ -109,14 +108,17 @@ pub struct Cmd {
     check_bal: bool,
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
+#[derive(Copy, Clone, Debug, ValueEnum, Default)]
 pub enum PriorityOrder {
+    /// Sort transactions by descending gas limit.
+    #[default]
+    #[clap(alias = "do")]
+    Descending,
+
     /// Sort transactions by ascending gas limit.
     #[clap(alias = "ao")]
     Ascending,
-    /// Sort transactions by descending gas limit.
-    #[clap(alias = "do")]
-    Descending,
+
     /// Do not sort by gas limit.
     None,
 }
@@ -530,7 +532,6 @@ fn execute_blocks_par(
                 bal.remove_at_address(&SYSTEM_CA_ADDRESSES);
                 bal.accounts.sort_keys();
 
-                output_bals.accounts.sort_keys();
                 if output_bals != bal {
                     write_data("bals-in.json", &bal);
                     write_data("bals-out.json", &output_bals);
@@ -569,13 +570,15 @@ fn test_par_exe_blocks() {
     let block_hashes = import_struct(cwd.join("./data/blockHashes_1.json"));
 
     let caches = prestates_to_cachedbs(prestates);
-    execute_blocks_par(
-        blocks,
-        bals,
-        caches,
-        block_hashes,
-        5,
-        PriorityOrder::Descending,
-        true,
+    let mut cmd_env = Cmd::default();
+    cmd_env.threads = 5;
+    cmd_env.check_bal = true;
+    cmd_env.debug = true;
+
+    let task_name = format!("threads: {}, blocks: {},", cmd_env.threads, bals.len(),);
+    measure!(
+        cmd_env.debug,
+        task_name,
+        execute_blocks_par(blocks, bals, caches, block_hashes, &cmd_env)
     );
 }
