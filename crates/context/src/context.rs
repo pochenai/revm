@@ -35,6 +35,8 @@ pub struct Context<
     pub local: LOCAL,
     /// Error that happened during execution.
     pub error: Result<(), ContextError<DB::Error>>,
+    /// Enable parallel sender recovery for 7702 tx.
+    pub par_7702: bool,
 }
 
 impl<
@@ -103,6 +105,11 @@ impl<
     fn error(&mut self) -> &mut Result<(), ContextError<<Self::Db as Database>::Error>> {
         &mut self.error
     }
+
+    #[inline]
+    fn par_7702(&self) -> bool {
+        self.par_7702
+    }
 }
 
 impl<
@@ -136,7 +143,7 @@ impl<
     /// Creates a new context with a new database type.
     ///
     /// This will create a new [`Journal`] object.
-    pub fn new(db: DB, spec: SpecId) -> Self {
+    pub fn new(db: DB, spec: SpecId, par_7702: bool) -> Self {
         let mut journaled_state = JOURNAL::new(db);
         journaled_state.set_spec_id(spec);
         Self {
@@ -150,6 +157,7 @@ impl<
             journaled_state,
             chain: Default::default(),
             error: Ok(()),
+            par_7702: par_7702,
         }
     }
 }
@@ -177,6 +185,7 @@ where
             local: self.local,
             chain: self.chain,
             error: Ok(()),
+            par_7702: self.par_7702,
         }
     }
 
@@ -198,6 +207,7 @@ where
             local: self.local,
             chain: self.chain,
             error: Ok(()),
+            par_7702: self.par_7702,
         }
     }
 
@@ -218,6 +228,7 @@ where
             local: self.local,
             chain: self.chain,
             error: Ok(()),
+            par_7702: self.par_7702,
         }
     }
 
@@ -234,6 +245,7 @@ where
             local: self.local,
             chain: self.chain,
             error: Ok(()),
+            par_7702: self.par_7702,
         }
     }
     /// Creates a new context with a new transaction type.
@@ -249,6 +261,7 @@ where
             local: self.local,
             chain: self.chain,
             error: Ok(()),
+            par_7702: self.par_7702,
         }
     }
 
@@ -262,6 +275,7 @@ where
             local: self.local,
             chain,
             error: Ok(()),
+            par_7702: self.par_7702,
         }
     }
 
@@ -279,6 +293,7 @@ where
             local: self.local,
             chain: self.chain,
             error: Ok(()),
+            par_7702: self.par_7702,
         }
     }
 
@@ -295,6 +310,7 @@ where
             local,
             chain: self.chain,
             error: Ok(()),
+            par_7702: self.par_7702,
         }
     }
 

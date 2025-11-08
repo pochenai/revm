@@ -63,11 +63,16 @@ where
 pub trait MainContext {
     /// Creates a new mainnet context with default configuration.
     fn mainnet() -> Self;
+    /// Creates a new mainnet context with default configuration and whether enable parallel sender recovery for 7702 tx.
+    fn mainnet_par7702(par_7702: bool) -> Self;
 }
 
 impl MainContext for Context<BlockEnv, TxEnv, CfgEnv, EmptyDB, Journal<EmptyDB>, ()> {
     fn mainnet() -> Self {
-        Context::new(EmptyDB::new(), SpecId::default())
+        Self::mainnet_par7702(false)
+    }
+    fn mainnet_par7702(par_7702: bool) -> Self {
+        Context::new(EmptyDB::new(), SpecId::default(), par_7702)
     }
 }
 

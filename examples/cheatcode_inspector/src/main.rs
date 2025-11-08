@@ -591,6 +591,7 @@ where
         chain: (),
         local: LocalContext::default(),
         error: Ok(()),
+        par_7702: false,
     };
 
     let mut evm = Evm::new_with_inspector(
@@ -645,6 +646,7 @@ fn main() -> anyhow::Result<()> {
         chain: (),
         local: LocalContext::default(),
         error: Ok(()),
+        par_7702: false,
     };
 
     let mut evm = Evm::new_with_inspector(

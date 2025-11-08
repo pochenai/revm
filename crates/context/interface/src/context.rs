@@ -152,6 +152,9 @@ pub trait ContextTr: Host {
         let (_, tx, _, _, _, local) = self.all_mut();
         (tx, local)
     }
+
+    /// Enable parallel sender recovery for 7702 tx.
+    fn par_7702(&self) -> bool;
 }
 
 /// Inner Context error used for Interpreter to set error without returning it from instruction

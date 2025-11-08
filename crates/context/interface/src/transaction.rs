@@ -18,6 +18,7 @@ use auto_impl::auto_impl;
 use core::cmp::min;
 use core::fmt::Debug;
 use primitives::{eip4844::GAS_PER_BLOB, Address, Bytes, TxKind, B256, U256};
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use std::boxed::Box;
 
 /// Transaction validity error types.
@@ -133,6 +134,9 @@ pub trait Transaction {
     ///
     /// [EIP-Set EOA account code for one transaction](https://eips.ethereum.org/EIPS/eip-7702)
     fn authorization_list(&self) -> impl Iterator<Item = Self::Authorization<'_>>;
+
+    /// List of authorizations for rayon
+    fn authorization_list_par(&self) -> impl ParallelIterator<Item = Self::Authorization<'_>>;
 
     /// Returns maximum fee that can be paid for the transaction.
     fn max_fee_per_gas(&self) -> u128 {

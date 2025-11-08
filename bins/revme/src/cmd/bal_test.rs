@@ -106,6 +106,9 @@ pub struct Cmd {
     /// Enable checking the re-execute generated bals is the same with input bals.
     #[arg(short = 'c', default_value_t = false)]
     check_bal: bool,
+    /// Disable parallel sender recovery for 7702 tx.
+    #[arg(short = 'a', default_value_t = false)]
+    par_7702: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, Default)]
@@ -121,6 +124,11 @@ pub enum PriorityOrder {
 
     /// Do not sort by gas limit.
     None,
+}
+
+enum Scheduler {
+    RoundRobin,
+    ConsumerProducer,
 }
 
 macro_rules! measure {
@@ -146,6 +154,8 @@ impl Cmd {
         let block_hashes = import_struct(format!("./data/blockHashes_{nblocks}.json"));
 
         let caches = prestates_to_cachedbs(prestates);
+
+        println!("7702:{}", self.par_7702);
 
         let task_name = format!("threads: {}, blocks: {},", self.threads, bals.len(),);
         measure!(
@@ -312,13 +322,14 @@ fn execute_blocks(
         let mut results = Vec::with_capacity(body.transactions.len());
         for (tx_index, tx) in body.transactions.iter().enumerate() {
             let changes = handle_tx(
-                block_env.clone(),
+                &block_env,
                 block_hashes.clone(),
                 bal_arc.clone(),
                 cache.clone(),
                 tx_index as u64,
                 tx,
                 debug,
+                false,
             );
             results.push((tx_index as u64 + 1, changes));
         }
@@ -347,13 +358,14 @@ fn execute_blocks(
 }
 
 fn handle_tx(
-    block_env: BlockEnv,
+    block_env: &BlockEnv,
     block_hashes: BTreeMap<u64, B256>,
     bal_arc: Arc<Bal>,
     cache: CacheState,
     tx_index: u64, // tx index start from 0, while the first tx's bal index is 1
     tx: &EthereumTxEnvelope<TxEip4844>,
     debug: bool,
+    par_7702: bool,
 ) -> Option<Bal> {
     // if debug {
     //     println!(
@@ -373,7 +385,9 @@ fn handle_tx(
 
     let blocknumber = block_env.number;
     // Create EVM context for each transaction to ensure fresh state access
-    let evm_context = Context::mainnet().with_block(block_env).with_db(&mut state);
+    let evm_context = Context::mainnet_par7702(par_7702)
+        .with_block(block_env)
+        .with_db(&mut state);
 
     let mut evm = evm_context.build_mainnet();
     let txenv = envelope_to_txenv(tx);
@@ -388,13 +402,7 @@ fn handle_tx(
             "execution error for block: {} tx: {}",
             blocknumber, tx_index
         )
-    } else {
-        // println!(
-        //     "execute success for block: {} tx: {}",
-        //     blocknumber, tx_index
-        // )
     }
-
     // must commit state changes, or bal builder will have nothing
     let result_state = exe_result.unwrap().state;
     evm.commit(result_state);
@@ -412,6 +420,8 @@ fn execute_blocks_par(
 ) {
     let mut sum_longest_tx_time = Duration::ZERO;
     let debug = cmd_env.debug;
+    let scheduler = Scheduler::ConsumerProducer;
+
     for (index, (block, (mut bal, cache))) in zip(blocks, zip(bals, caches)).into_iter().enumerate()
     {
         let block_env = BlockEnv {
@@ -439,14 +449,14 @@ fn execute_blocks_par(
         match cmd_env.schedule_by_gaslimit {
             PriorityOrder::Ascending => {
                 measure!(
-                    debug,
+                    false,
                     "sort_tx_ascending",
                     indexed_txs.sort_by_key(|(_, tx)| tx.gas_limit())
                 );
             }
             PriorityOrder::Descending => {
                 measure!(
-                    debug,
+                    false,
                     "sort_tx_descending",
                     indexed_txs.sort_by_key(|(_, tx)| std::cmp::Reverse(tx.gas_limit()))
                 );
@@ -454,72 +464,54 @@ fn execute_blocks_par(
             PriorityOrder::None => { /* no sort */ }
         }
 
-        // Work channel
-        let (task_sender, task_receiver) = unbounded();
-        for task in indexed_txs.iter() {
-            task_sender.send(task).unwrap();
-        }
-        drop(task_sender); // close sender so workers know when finished
-
-        // Result channel
-        let (res_sender, res_receiver) = unbounded();
-
-        // Build thread pool
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(cmd_env.threads)
-            .build()
-            .expect("Failed to build Rayon pool");
-
-        pool.install(|| {
-            (0..cmd_env.threads).into_par_iter().for_each(|_| {
-                // let task_receiver = task_receiver.iter().cloned();
-                while let Ok((index, tx)) = task_receiver.recv() {
-                    let (elapsed, bal) = measure!(
-                        false,
-                        format!("tx {}", index),
-                        handle_tx(
-                            block_env.clone(),
-                            block_hashes.clone(),
-                            bal_arc.clone(),
-                            cache.clone(),
-                            *index as u64,
-                            tx,
-                            debug
-                        )
-                    );
-
-                    res_sender
-                        .send((*index as u64 + 1, bal, elapsed))
-                        .expect("Failed to send result");
-                }
-            });
-        });
-
-        // Drop the last res_sender to close the channel
-        drop(res_sender);
-        // Collect all results from the channel
-        let mut results: Vec<_> = res_receiver.into_iter().collect();
+        let mut results = match scheduler {
+            Scheduler::RoundRobin => round_robin_schedule(
+                cmd_env,
+                &indexed_txs,
+                &block_env,
+                &block_hashes,
+                bal_arc,
+                cache,
+            ),
+            Scheduler::ConsumerProducer => channel_schedule(
+                cmd_env,
+                &indexed_txs,
+                &block_env,
+                &block_hashes,
+                bal_arc,
+                cache,
+            ),
+        };
 
         if debug {
             let mut max_elapsed = Duration::ZERO;
             let mut max_elapsed_idx = 0;
-            for (bal_index, _, elapsed) in &results {
+            let mut max_elapsed_tx = &indexed_txs[0].1;
+            for (bal_index, _, elapsed, tx) in &results {
                 if elapsed > &max_elapsed {
                     max_elapsed = *elapsed;
                     max_elapsed_idx = bal_index - 1;
+                    max_elapsed_tx = tx;
                 }
             }
-            println!(
-                "Block {} → tx #{} (0-based index) took the longest: {:?}",
-                block_env.number, max_elapsed_idx, max_elapsed
-            );
+
+            if max_elapsed > Duration::from_millis(10) {
+                println!(
+                    "Block {} → tx #{} (0-based index), type:{},hash:{}, took the longest: {:?}",
+                    block_env.number,
+                    max_elapsed_idx,
+                    max_elapsed_tx.tx_type(),
+                    max_elapsed_tx.hash(),
+                    max_elapsed
+                );
+            }
 
             sum_longest_tx_time += max_elapsed;
 
             if cmd_env.check_bal {
                 let mut output_bals = Bal::default();
-                results.sort_by_key(|(bal_index, _, _)| *bal_index);
-                for (bal_index, bal, elapsed) in results {
+                results.sort_by_key(|(bal_index, _, _, _)| *bal_index);
+                for (bal_index, bal, elapsed, _) in results {
                     if let Some(bal) = bal {
                         output_bals.merge_bal(bal, bal_index);
                     }
@@ -547,6 +539,130 @@ fn execute_blocks_par(
             sum_longest_tx_time
         );
     }
+}
+
+fn round_robin_schedule<'a>(
+    cmd_env: &'a Cmd,
+    indexed_txs: &'a Vec<(usize, EthereumTxEnvelope<TxEip4844>)>,
+    block_env: &'a BlockEnv,
+    block_hashes: &BTreeMap<u64, B256>,
+    bal_arc: Arc<Bal>,
+    cache: CacheState,
+) -> Vec<(
+    u64,
+    Option<Bal>,
+    Duration,
+    &'a EthereumTxEnvelope<TxEip4844>,
+)> {
+    let threads = cmd_env.threads;
+    let debug = cmd_env.debug;
+
+    // Build thread pool
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .expect("Failed to build Rayon pool");
+
+    let mut results: Vec<(u64, Option<Bal>, Duration, &EthereumTxEnvelope<TxEip4844>)> = pool
+        .install(|| {
+            let results: Vec<_> = (0..threads)
+                .into_par_iter()
+                .flat_map(|tid| {
+                    let mut result = Vec::with_capacity(indexed_txs.len() / threads + 1);
+                    // 每个线程分配 {tid, tid+threads, tid+2*threads, ...}
+                    let mut i = tid;
+                    while i < indexed_txs.len() {
+                        let (index, tx) = &indexed_txs[i];
+                        let (elapsed, bal) = measure!(
+                            false,
+                            format!("tx {}", index),
+                            handle_tx(
+                                &block_env,
+                                block_hashes.clone(),
+                                bal_arc.clone(),
+                                cache.clone(),
+                                *index as u64,
+                                tx,
+                                debug,
+                                cmd_env.par_7702,
+                            )
+                        );
+                        result.push((*index as u64 + 1, bal, elapsed, tx));
+
+                        i += threads;
+                    }
+
+                    result
+                })
+                .collect();
+
+            results
+        });
+    results
+}
+
+// only a bit faster than manual round robin schedule.
+fn channel_schedule<'a>(
+    cmd_env: &'a Cmd,
+    indexed_txs: &'a Vec<(usize, EthereumTxEnvelope<TxEip4844>)>,
+    block_env: &'a BlockEnv,
+    block_hashes: &BTreeMap<u64, B256>,
+    bal_arc: Arc<Bal>,
+    cache: CacheState,
+) -> Vec<(
+    u64,
+    Option<Bal>,
+    Duration,
+    &'a EthereumTxEnvelope<TxEip4844>,
+)> {
+    let threads = cmd_env.threads;
+    let debug = cmd_env.debug;
+    // Build thread pool
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .expect("Failed to build Rayon pool");
+
+    // Work channel
+    let (task_sender, task_receiver) = unbounded();
+    for task in indexed_txs.iter() {
+        task_sender.send(task).unwrap();
+    }
+    drop(task_sender); // close sender so workers know when finished
+
+    // Result channel
+    let (res_sender, res_receiver) = unbounded();
+
+    pool.install(|| {
+        (0..threads).into_par_iter().for_each(|_| {
+            // let task_receiver = task_receiver.iter().cloned();
+            while let Ok((index, tx)) = task_receiver.recv() {
+                let (elapsed, bal) = measure!(
+                    false,
+                    format!("tx {}", index),
+                    handle_tx(
+                        &block_env,
+                        block_hashes.clone(),
+                        bal_arc.clone(),
+                        cache.clone(),
+                        *index as u64,
+                        tx,
+                        debug,
+                        cmd_env.par_7702,
+                    )
+                );
+
+                res_sender
+                    .send((*index as u64 + 1, bal, elapsed, tx))
+                    .expect("Failed to send result");
+            }
+        });
+    });
+
+    // Drop the last res_sender to close the channel
+    drop(res_sender);
+    // Collect all results from the channel
+    res_receiver.into_iter().collect()
 }
 
 #[test]

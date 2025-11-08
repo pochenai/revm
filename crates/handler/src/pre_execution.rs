@@ -13,8 +13,10 @@ use context_interface::{
     Block, Cfg, Database,
 };
 use core::cmp::Ordering;
+use crossbeam::channel::unbounded;
 use primitives::{eip7702, hardfork::SpecId, U256};
 use primitives::{Address, HashMap, HashSet, StorageKey};
+use rayon::{prelude::*, ThreadPoolBuilder};
 use state::AccountInfo;
 
 /// Loads and warms accounts for execution, including precompiles and access list.
@@ -195,9 +197,84 @@ pub fn apply_eip7702_auth_list<
     }
 
     let chain_id = context.cfg().chain_id();
+    let par_7702 = context.par_7702();
+
     let (tx, journal) = context.tx_journal_mut();
 
     let mut refunded_accounts = 0;
+
+    if par_7702 {
+        let authorition_len = tx.authorization_list_len();
+        // Work channel
+        let (res_sender, res_receiver) = unbounded();
+
+        tx.authorization_list_par().for_each(|authorization| {
+            // 1. Verify the chain id is either 0 or the chain's current ID.
+            let auth_chain_id = authorization.chain_id();
+            if !auth_chain_id.is_zero() && auth_chain_id != U256::from(chain_id) {
+                return res_sender
+                    .send((None, authorization))
+                    .expect("Failed to send result");
+            }
+
+            // 2. Verify the `nonce` is less than `2**64 - 1`.
+            if authorization.nonce() == u64::MAX {
+                return res_sender
+                    .send((None, authorization))
+                    .expect("Failed to send result");
+            }
+
+            return res_sender
+                .send((authorization.authority(), authorization))
+                .expect("Failed to send result");
+        });
+
+        for _ in 0..authorition_len {
+            let (recovered_authority, authorization) = res_receiver.recv().unwrap();
+            // recover authority and authorized addresses.
+            // 3. `authority = ecrecover(keccak(MAGIC || rlp([chain_id, address, nonce])), y_parity, r, s]`
+            let Some(authority) = recovered_authority else {
+                continue;
+            };
+
+            // warm authority account and check nonce.
+            // 4. Add `authority` to `accessed_addresses` (as defined in [EIP-2929](./eip-2929.md).)
+            let mut authority_acc = journal.load_account_with_code_mut(authority)?;
+
+            // 5. Verify the code of `authority` is either empty or already delegated.
+            if let Some(bytecode) = &authority_acc.info.code {
+                // if it is not empty and it is not eip7702
+                if !bytecode.is_empty() && !bytecode.is_eip7702() {
+                    continue;
+                }
+            }
+
+            // 6. Verify the nonce of `authority` is equal to `nonce`. In case `authority` does not exist in the trie, verify that `nonce` is equal to `0`.
+            if authorization.nonce() != authority_acc.info.nonce {
+                continue;
+            }
+
+            // 7. Add `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` gas to the global refund counter if `authority` exists in the trie.
+            if !(authority_acc.is_empty() && authority_acc.is_loaded_as_not_existing_not_touched())
+            {
+                refunded_accounts += 1;
+            }
+
+            // 8. Set the code of `authority` to be `0xef0100 || address`. This is a delegation designation.
+            //  * As a special case, if `address` is `0x0000000000000000000000000000000000000000` do not write the designation.
+            //    Clear the accounts code and reset the account's code hash to the empty hash `0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470`.
+            // 9. Increase the nonce of `authority` by one.
+            authority_acc.delegate(authorization.address());
+        }
+
+        // Drop the last res_sender to close the channel
+        drop(res_sender);
+
+        let refunded_gas =
+            refunded_accounts * (eip7702::PER_EMPTY_ACCOUNT_COST - eip7702::PER_AUTH_BASE_COST);
+
+        return Ok(refunded_gas);
+    }
     for authorization in tx.authorization_list() {
         // 1. Verify the chain id is either 0 or the chain's current ID.
         let auth_chain_id = authorization.chain_id();
