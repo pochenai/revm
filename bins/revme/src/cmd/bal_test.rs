@@ -155,17 +155,21 @@ impl Cmd {
 
         let caches = prestates_to_cachedbs(prestates);
 
-        println!("7702:{}", self.par_7702);
-
         let task_name = format!("threads: {}, blocks: {},", self.threads, bals.len(),);
-        measure!(
+        let (elapsed, gas_used) = measure!(
             true,
             task_name,
             if self.par {
-                execute_blocks_par(blocks, bals, caches, block_hashes, self);
+                execute_blocks_par(blocks, bals, caches, block_hashes, self)
             } else {
-                execute_blocks(blocks, bals, caches, block_hashes, self.debug);
+                execute_blocks(blocks, bals, caches, block_hashes, self.debug)
             }
+        );
+
+        println!(
+            "total gas used:{}M, gas per second:{:?} MGas/s",
+            gas_used / 1_000_000,
+            gas_used / (elapsed.as_millis() as u64) / 1000
         );
 
         Ok(())
@@ -251,9 +255,11 @@ fn execute_blocks(
     caches: Vec<CacheState>,
     block_hashes: BTreeMap<u64, B256>,
     debug: bool,
-) {
+) -> u64 {
+    let mut total_gas_used = 0;
     for (index, (block, (mut bal, cache))) in zip(blocks, zip(bals, caches)).into_iter().enumerate()
     {
+        total_gas_used += block.gas_used;
         let block_env = BlockEnv {
             number: U256::from(block.number),
             beneficiary: block.beneficiary,
@@ -352,9 +358,11 @@ fn execute_blocks(
                 output_bals, bal,
                 "bals for tx {} in block {} is not equal",
                 index, block_env.number
-            )
+            );
         }
     }
+
+    total_gas_used
 }
 
 fn handle_tx(
@@ -417,13 +425,15 @@ fn execute_blocks_par(
     caches: Vec<CacheState>,
     block_hashes: BTreeMap<u64, B256>,
     cmd_env: &Cmd,
-) {
+) -> u64 {
     let mut sum_longest_tx_time = Duration::ZERO;
     let debug = cmd_env.debug;
     let scheduler = Scheduler::ConsumerProducer;
+    let mut total_gas_used = 0;
 
     for (index, (block, (mut bal, cache))) in zip(blocks, zip(bals, caches)).into_iter().enumerate()
     {
+        total_gas_used += block.gas_used;
         let block_env = BlockEnv {
             number: U256::from(block.number),
             beneficiary: block.beneficiary,
@@ -539,6 +549,8 @@ fn execute_blocks_par(
             sum_longest_tx_time
         );
     }
+
+    total_gas_used
 }
 
 fn round_robin_schedule<'a>(
