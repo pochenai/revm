@@ -97,8 +97,8 @@ pub struct Cmd {
     /// Number of blocks (n) for file blocks_n.json, bals_n.json, blockHashes_n.json, prestates_n.json.
     #[arg(short = 'n', default_value_t = 1)]
     nblocks: u64,
-    /// Process txs prioritized by gas limit order, "do":descending, "ao": ascending, "none": random shedule.
-    #[arg(short = 's', value_enum, default_value = "do")]
+    /// Process txs prioritized by gas used or limit order, "gasUsedDo":gas used descending order, "gasLimitDo": gas limit descending order, "ao": gas limit ascending order, "none": random shedule.
+    #[arg(short = 's', value_enum, default_value = "gasUsedDo")]
     schedule_by_gaslimit: PriorityOrder,
     /// Enable showing debug info.
     #[arg(short = 'd', default_value_t = false)]
@@ -118,12 +118,14 @@ pub struct Cmd {
 pub enum PriorityOrder {
     /// Sort transactions by descending gas limit.
     #[default]
-    #[clap(alias = "do")]
-    Descending,
+    #[clap(alias = "gasUsedDo")]
+    GasUsedDescending,
 
+    #[clap(alias = "gasLimitDo")]
+    GasLimitDescending,
     /// Sort transactions by ascending gas limit.
     #[clap(alias = "ao")]
-    Ascending,
+    GasLimitAscending,
 
     /// Do not sort by gas limit.
     None,
@@ -155,6 +157,7 @@ impl Cmd {
         let bals: Vec<Bal> = import_struct(format!("./data/bals_{nblocks}.json"));
         let prestates = import_struct(format!("./data/prestates_{nblocks}.json"));
         let block_hashes = import_struct(format!("./data/blockHashes_{nblocks}.json"));
+        let gasused = import_struct(format!("./data/gasused_{nblocks}.json"));
 
         let caches = prestates_to_cachedbs(prestates);
 
@@ -163,7 +166,7 @@ impl Cmd {
             true,
             task_name,
             if self.par {
-                execute_blocks_par(blocks, bals, caches, block_hashes, self)
+                execute_blocks_par(blocks, bals, caches, block_hashes, gasused, self)
             } else {
                 execute_blocks(blocks, bals, caches, block_hashes, self.debug)
             }
@@ -259,6 +262,8 @@ fn execute_blocks(
     block_hashes: BTreeMap<u64, B256>,
     debug: bool,
 ) -> u64 {
+    let mut blocks_gas_used = vec![];
+
     let mut total_gas_used = 0;
     for (index, (block, (mut bal, cache))) in zip(blocks, zip(bals, caches)).into_iter().enumerate()
     {
@@ -346,14 +351,19 @@ fn execute_blocks(
         // TODO: add post-tx bals
 
         if debug {
+            let mut block_gas_used = Vec::with_capacity(results.len());
             let mut output_bals = Bal::default();
-            for (bal_index, bal) in results {
+            for (bal_index, (bal, gas_used)) in results {
                 if let Some(bal) = bal {
                     output_bals.merge_bal(bal, bal_index);
                 }
+                block_gas_used.push(gas_used);
             }
-            output_bals.accounts.sort_keys();
+
             // remove pre-tx and post-tx bals
+            output_bals.remove_at_address(&SYSTEM_CA_ADDRESSES);
+            output_bals.accounts.sort_keys();
+
             bal.remove_first_last();
             bal.remove_at_address(&SYSTEM_CA_ADDRESSES);
             bal.accounts.sort_keys();
@@ -362,9 +372,14 @@ fn execute_blocks(
                 "bals for tx {} in block {} is not equal",
                 index, block_env.number
             );
+
+            // write gas used
+            blocks_gas_used.push(block_gas_used);
         }
     }
 
+    println!("write block gas used!");
+    write_data("gas_used.json", &blocks_gas_used);
     total_gas_used
 }
 
@@ -377,7 +392,7 @@ fn handle_tx(
     tx: &EthereumTxEnvelope<TxEip4844>,
     debug: bool,
     par_7702: bool,
-) -> Option<Bal> {
+) -> (Option<Bal>, u64) {
     // if debug {
     //     println!(
     //         "txindex:{:>3}, gaslimit:{:>8} start",
@@ -415,9 +430,11 @@ fn handle_tx(
         )
     }
     // must commit state changes, or bal builder will have nothing
-    let result_state = exe_result.unwrap().state;
+    let exe_result = exe_result.unwrap();
+    let gas_used = exe_result.result.gas_used();
+    let result_state = exe_result.state;
     evm.commit(result_state);
-    state.bal_builder
+    (state.bal_builder, gas_used)
     // print!("exe_result:{:?}", exe_result)
 }
 
@@ -427,6 +444,7 @@ fn execute_blocks_par(
     bals: Vec<Bal>,
     caches: Vec<CacheState>,
     block_hashes: BTreeMap<u64, B256>,
+    txs_gas_used: Vec<Vec<u64>>,
     cmd_env: &Cmd,
 ) -> u64 {
     let mut sum_longest_tx_time = Duration::ZERO;
@@ -435,19 +453,24 @@ fn execute_blocks_par(
     let mut total_gas_used = 0;
     let batch = cmd_env.batch_blocks;
 
-    for (index, (blocks, (mut bals, caches))) in zip(
+    for (index, (blocks, (mut bals, (caches, txs_gas_used)))) in zip(
         blocks.chunks(batch),
-        zip(bals.chunks(batch), caches.chunks(batch)),
+        zip(
+            bals.chunks(batch),
+            zip(caches.chunks(batch), txs_gas_used.chunks(batch)),
+        ),
     )
     .into_iter()
     .enumerate()
     {
-        let mut indexed_txs: Vec<(usize, EthereumTxEnvelope<TxEip4844>, usize)> = vec![];
+        let mut indexed_txs = vec![];
 
         let mut block_envs = Vec::with_capacity(blocks.len());
         let mut bal_arcs = Vec::with_capacity(blocks.len());
 
-        for (block_index, block) in blocks.into_iter().enumerate() {
+        for (block_index, (block, block_txs_gas_used)) in
+            zip(blocks, txs_gas_used).into_iter().enumerate()
+        {
             total_gas_used += block.gas_used;
 
             let block_env = BlockEnv {
@@ -472,23 +495,31 @@ fn execute_blocks_par(
             let body = block.clone().into_body();
 
             for (tx_index, tx) in body.transactions.into_iter().enumerate() {
-                indexed_txs.push((tx_index, tx, block_index));
+                indexed_txs.push((tx_index, tx, block_index, block_txs_gas_used[tx_index]));
             }
         }
 
         match cmd_env.schedule_by_gaslimit {
-            PriorityOrder::Ascending => {
+            PriorityOrder::GasLimitAscending => {
                 measure!(
                     false,
                     "sort_tx_ascending",
-                    indexed_txs.sort_by_key(|(_, tx, _)| tx.gas_limit())
+                    indexed_txs.sort_by_key(|(_, tx, _, gas_used)| tx.gas_limit())
                 );
             }
-            PriorityOrder::Descending => {
+            PriorityOrder::GasLimitDescending => {
                 measure!(
                     false,
                     "sort_tx_descending",
-                    indexed_txs.sort_by_key(|(_, tx, _)| std::cmp::Reverse(tx.gas_limit()))
+                    indexed_txs
+                        .sort_by_key(|(_, tx, _, gas_used)| std::cmp::Reverse(tx.gas_limit()))
+                );
+            }
+            PriorityOrder::GasUsedDescending => {
+                measure!(
+                    false,
+                    "sort_tx_descending",
+                    indexed_txs.sort_by_key(|(_, tx, _, gas_used)| std::cmp::Reverse(*gas_used))
                 );
             }
             PriorityOrder::None => { /* no sort */ }
@@ -518,7 +549,7 @@ fn execute_blocks_par(
             let mut max_elapsed_idx = 0;
             let mut max_elapsed_tx = &indexed_txs[0].1;
             let mut max_block_index: usize = 0;
-            for (bal_index, _, elapsed, tx, block_index) in &results {
+            for (bal_index, _, elapsed, tx, block_index, gas_used) in &results {
                 if elapsed > &max_elapsed {
                     max_elapsed = *elapsed;
                     max_elapsed_idx = bal_index - 1;
@@ -577,7 +608,7 @@ fn execute_blocks_par(
 
 fn round_robin_schedule<'a>(
     cmd_env: &'a Cmd,
-    indexed_txs: &'a Vec<(usize, EthereumTxEnvelope<TxEip4844>, usize)>,
+    indexed_txs: &'a Vec<(usize, EthereumTxEnvelope<TxEip4844>, usize, u64)>,
     block_envs: Vec<BlockEnv>,
     block_hashes: &BTreeMap<u64, B256>,
     bal_arcs: Vec<Arc<Bal>>,
@@ -588,6 +619,7 @@ fn round_robin_schedule<'a>(
     Duration,
     &'a EthereumTxEnvelope<TxEip4844>,
     &'a usize,
+    u64,
 )> {
     let threads = cmd_env.threads;
     let debug = cmd_env.debug;
@@ -604,16 +636,17 @@ fn round_robin_schedule<'a>(
         Duration,
         &EthereumTxEnvelope<TxEip4844>,
         &usize,
+        u64,
     )> = pool.install(|| {
         let results: Vec<_> = (0..threads)
             .into_par_iter()
             .flat_map(|tid| {
                 let mut result = Vec::with_capacity(indexed_txs.len() / threads + 1);
-                // 每个线程分配 {tid, tid+threads, tid+2*threads, ...}
+                // each thread {tid, tid+threads, tid+2*threads, ...}
                 let mut i = tid;
                 while i < indexed_txs.len() {
-                    let (index, tx, block_index) = &indexed_txs[i];
-                    let (elapsed, bal) = measure!(
+                    let (index, tx, block_index, _) = &indexed_txs[i];
+                    let (elapsed, (bal, gas_used)) = measure!(
                         false,
                         format!("tx {}", index),
                         handle_tx(
@@ -627,7 +660,7 @@ fn round_robin_schedule<'a>(
                             cmd_env.par_7702,
                         )
                     );
-                    result.push((*index as u64 + 1, bal, elapsed, tx, block_index));
+                    result.push((*index as u64 + 1, bal, elapsed, tx, block_index, gas_used));
 
                     i += threads;
                 }
@@ -644,7 +677,7 @@ fn round_robin_schedule<'a>(
 // only a bit faster than manual round robin schedule.
 fn channel_schedule<'a>(
     cmd_env: &'a Cmd,
-    indexed_txs: &'a Vec<(usize, EthereumTxEnvelope<TxEip4844>, usize)>,
+    indexed_txs: &'a Vec<(usize, EthereumTxEnvelope<TxEip4844>, usize, u64)>,
     block_envs: Vec<BlockEnv>,
     block_hashes: &BTreeMap<u64, B256>,
     bal_arcs: Vec<Arc<Bal>>,
@@ -655,6 +688,7 @@ fn channel_schedule<'a>(
     Duration,
     &'a EthereumTxEnvelope<TxEip4844>,
     &'a usize,
+    u64,
 )> {
     let threads = cmd_env.threads;
     let debug = cmd_env.debug;
@@ -677,8 +711,8 @@ fn channel_schedule<'a>(
     pool.install(|| {
         (0..threads).into_par_iter().for_each(|_| {
             // let task_receiver = task_receiver.iter().cloned();
-            while let Ok((index, tx, block_index)) = task_receiver.recv() {
-                let (elapsed, bal) = measure!(
+            while let Ok((index, tx, block_index, _)) = task_receiver.recv() {
+                let (elapsed, (bal, gas_used)) = measure!(
                     false,
                     format!("tx {}", index),
                     handle_tx(
@@ -694,7 +728,7 @@ fn channel_schedule<'a>(
                 );
 
                 res_sender
-                    .send((*index as u64 + 1, bal, elapsed, tx, block_index))
+                    .send((*index as u64 + 1, bal, elapsed, tx, block_index, gas_used))
                     .expect("Failed to send result");
             }
         });
@@ -725,6 +759,7 @@ fn test_par_exe_blocks() {
     let bals: Vec<Bal> = import_struct(cwd.join("./data/bals_1.json"));
     let prestates = import_struct(cwd.join("./data/prestates_1.json"));
     let block_hashes = import_struct(cwd.join("./data/blockHashes_1.json"));
+    let gas_used = import_struct(cwd.join("./data/gasused_1.json"));
 
     let caches = prestates_to_cachedbs(prestates);
     let mut cmd_env = Cmd::default();
@@ -736,6 +771,6 @@ fn test_par_exe_blocks() {
     measure!(
         cmd_env.debug,
         task_name,
-        execute_blocks_par(blocks, bals, caches, block_hashes, &cmd_env)
+        execute_blocks_par(blocks, bals, caches, block_hashes, gas_used, &cmd_env,)
     );
 }
