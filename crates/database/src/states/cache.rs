@@ -2,7 +2,8 @@ use super::{
     plain_account::PlainStorage, transition_account::TransitionAccount, CacheAccount, PlainAccount,
 };
 use bytecode::Bytecode;
-use primitives::{Address, HashMap, B256};
+use database_interface::{DBErrorMarker, DatabaseRef};
+use primitives::{Address, HashMap, StorageKey, StorageValue, B256};
 use state::{Account, AccountInfo, EvmState};
 use std::vec::Vec;
 
@@ -225,5 +226,80 @@ impl CacheState {
         } else {
             Some(this_account.change(account.info, changed_storage))
         }
+    }
+}
+
+///
+#[derive(Debug)]
+pub struct MyError {
+    ///
+    pub message: String,
+}
+
+impl std::fmt::Display for MyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MyError: {}", self.message)
+    }
+}
+
+impl std::error::Error for MyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
+}
+
+impl DBErrorMarker for MyError {}
+
+impl DatabaseRef for CacheState {
+    type Error = MyError;
+
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        // Account is already in cache
+        if let Some(account) = self.accounts.get(&address) {
+            return Ok(account.account_info());
+        } else {
+            return Err(MyError {
+                message: String::from("basic_ref error"),
+            });
+        }
+    }
+
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        // Check if code is in cache
+        if let Some(code) = self.contracts.get(&code_hash) {
+            return Ok(code.clone());
+        } else {
+            return Err(MyError {
+                message: String::from("code_by_hash_ref error"),
+            });
+        }
+    }
+
+    fn storage_ref(
+        &self,
+        address: Address,
+        index: StorageKey,
+    ) -> Result<StorageValue, Self::Error> {
+        // Check if account is in cache, the account is not guaranteed to be loaded
+        if let Some(account) = self.accounts.get(&address) {
+            if let Some(plain_account) = &account.account {
+                // If storage is known, we can return it
+                if let Some(storage_value) = plain_account.storage.get(&index) {
+                    return Ok(*storage_value);
+                }
+                // If account was destroyed or account is newly built
+                // we return zero and don't ask database.
+                if account.status.is_storage_known() {
+                    return Ok(StorageValue::ZERO);
+                }
+            }
+        }
+        return Err(MyError {
+            message: String::from("storage_ref error"),
+        });
+    }
+
+    fn block_hash_ref(&self, _: u64) -> Result<B256, Self::Error> {
+        unimplemented!("block_hash_ref")
     }
 }

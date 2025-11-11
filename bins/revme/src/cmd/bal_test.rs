@@ -92,7 +92,7 @@ pub struct Cmd {
     #[arg(short = 't', default_value_t = 1)]
     threads: usize,
     /// Enable parallel execution by default (exe sequentially is the same as setting -t 1).
-    #[arg(short = 'p', default_value_t = true)]
+    #[arg(short = 'p', default_value_t = false)]
     par: bool,
     /// Number of blocks (n) for file blocks_n.json, bals_n.json, blockHashes_n.json, prestates_n.json.
     #[arg(short = 'n', default_value_t = 1)]
@@ -265,6 +265,8 @@ fn execute_blocks(
     let mut blocks_gas_used = vec![];
     let block_hashes = Arc::new(block_hashes);
 
+    let mut total_clone_time = Duration::ZERO;
+
     let mut total_gas_used = 0;
     for (index, (block, (mut bal, cache))) in zip(blocks, zip(bals, caches)).into_iter().enumerate()
     {
@@ -283,7 +285,9 @@ fn execute_blocks(
             )),
         };
 
-        let bal_arc = Arc::new(bal.clone());
+        let (elasped, bal_clone) = measure!(false, "bal_clone", bal.clone());
+        let bal_arc = Arc::new(bal_clone);
+        total_clone_time += elasped;
 
         let parent_hash = block.parent_hash;
         let parent_beacon_root = block.parent_beacon_block_root.unwrap();
@@ -335,18 +339,23 @@ fn execute_blocks(
 
         // txs
         let mut results = Vec::with_capacity(body.transactions.len());
+
         for (tx_index, tx) in body.transactions.iter().enumerate() {
+            let (elasped, (block_hashes_clone, bal_arc_clone)) = measure!(false, "clone", {
+                (Arc::clone(&block_hashes), bal_arc.clone())
+            });
             let changes = handle_tx(
                 &block_env,
-                Arc::clone(&block_hashes),
-                bal_arc.clone(),
-                cache.clone(),
+                block_hashes_clone,
+                bal_arc_clone,
+                &cache,
                 tx_index as u64,
                 tx,
                 debug,
                 false,
             );
             results.push((tx_index as u64 + 1, changes));
+            total_clone_time += elasped;
         }
 
         // TODO: add post-tx bals
@@ -378,9 +387,9 @@ fn execute_blocks(
             blocks_gas_used.push(block_gas_used);
         }
     }
-
-    println!("write block gas used!");
-    write_data("gas_used.json", &blocks_gas_used);
+    println!("total clone time:{:?}", total_clone_time);
+    // println!("write block gas used!");
+    // write_data("gas_used.json", &blocks_gas_used);
     total_gas_used
 }
 
@@ -388,7 +397,7 @@ fn handle_tx(
     block_env: &BlockEnv,
     block_hashes: Arc<BTreeMap<u64, B256>>,
     bal_arc: Arc<Bal>,
-    cache: CacheState,
+    cache: &CacheState,
     tx_index: u64, // tx index start from 0, while the first tx's bal index is 1
     tx: &EthereumTxEnvelope<TxEip4844>,
     debug: bool,
@@ -403,7 +412,7 @@ fn handle_tx(
     // }
     let cached_state = State::builder()
         .with_block_hashes(block_hashes)
-        .with_cached_prestate(cache)
+        .with_database_ref(cache)
         .build();
     let mut state = BalDatabase::new(cached_state)
         .with_bal_builder()
@@ -655,7 +664,7 @@ fn round_robin_schedule<'a>(
                             &block_envs[*block_index],
                             block_hashes.clone(),
                             bal_arcs[*block_index].clone(),
-                            caches[*block_index].clone(),
+                            &caches[*block_index],
                             *index as u64,
                             tx,
                             debug,
@@ -721,7 +730,7 @@ fn channel_schedule<'a>(
                         &block_envs[*block_index],
                         block_hashes.clone(),
                         bal_arcs[*block_index].clone(),
-                        caches[*block_index].clone(),
+                        &caches[*block_index],
                         *index as u64,
                         tx,
                         debug,
