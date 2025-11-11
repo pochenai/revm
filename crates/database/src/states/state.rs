@@ -9,6 +9,7 @@ use state::{Account, AccountInfo};
 use std::{
     boxed::Box,
     collections::{btree_map, BTreeMap},
+    sync::Arc,
     vec::Vec,
 };
 
@@ -62,7 +63,7 @@ pub struct State<DB> {
     /// This map can be used to give different values for block hashes if in case.
     ///
     /// The fork block is different or some blocks are not saved inside database.
-    pub block_hashes: BTreeMap<u64, B256>,
+    pub block_hashes: Arc<BTreeMap<u64, B256>>,
 }
 
 // Have ability to call State::builder without having to specify the type.
@@ -288,24 +289,25 @@ impl<DB: Database> Database for State<DB> {
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
-        match self.block_hashes.entry(number) {
-            btree_map::Entry::Occupied(entry) => Ok(*entry.get()),
-            btree_map::Entry::Vacant(entry) => {
-                let ret = *entry.insert(self.database.block_hash(number)?);
+        Ok(*self.block_hashes.get(&number).unwrap())
+        // match self.block_hashes.entry(number) {
+        //     btree_map::Entry::Occupied(entry) => Ok(*entry.get()),
+        //     btree_map::Entry::Vacant(entry) => {
+        //         let ret = *entry.insert(self.database.block_hash(number)?);
 
-                // Prune all hashes that are older than BLOCK_HASH_HISTORY
-                let last_block = number.saturating_sub(BLOCK_HASH_HISTORY);
-                while let Some(entry) = self.block_hashes.first_entry() {
-                    if *entry.key() < last_block {
-                        entry.remove();
-                    } else {
-                        break;
-                    }
-                }
+        //         // Prune all hashes that are older than BLOCK_HASH_HISTORY
+        //         let last_block = number.saturating_sub(BLOCK_HASH_HISTORY);
+        //         while let Some(entry) = self.block_hashes.first_entry() {
+        //             if *entry.key() < last_block {
+        //                 entry.remove();
+        //             } else {
+        //                 break;
+        //             }
+        //         }
 
-                Ok(ret)
-            }
-        }
+        //         Ok(ret)
+        //     }
+        // }
     }
 }
 
@@ -410,13 +412,13 @@ mod tests {
 
         assert_eq!(
             state.block_hashes,
-            BTreeMap::from([(1, block1_hash), (2, block2_hash)])
+            Arc::new(BTreeMap::from([(1, block1_hash), (2, block2_hash)]))
         );
 
         state.block_hash(test_number).unwrap();
         assert_eq!(
             state.block_hashes,
-            BTreeMap::from([(test_number, block_test_hash), (2, block2_hash)])
+            Arc::new(BTreeMap::from([(test_number, block_test_hash), (2, block2_hash)]))
         );
     }
 

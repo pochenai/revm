@@ -1,7 +1,7 @@
 use super::{cache::CacheState, state::DBBox, BundleState, State, TransitionState};
 use database_interface::{DBErrorMarker, Database, DatabaseRef, EmptyDB, WrapDatabaseRef};
 use primitives::B256;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 /// Allows building of State and initializing it with different options.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,7 +28,7 @@ pub struct StateBuilder<DB> {
     /// Default is false.
     with_background_transition_merge: bool,
     /// If we want to set different block hashes,
-    with_block_hashes: BTreeMap<u64, B256>,
+    with_block_hashes: Arc<BTreeMap<u64, B256>>,
 }
 
 impl StateBuilder<EmptyDB> {
@@ -57,7 +57,7 @@ impl<DB: Database> StateBuilder<DB> {
             with_bundle_prestate: None,
             with_bundle_update: false,
             with_background_transition_merge: false,
-            with_block_hashes: BTreeMap::new(),
+            with_block_hashes: Arc::new(BTreeMap::new()),
         }
     }
 
@@ -151,7 +151,7 @@ impl<DB: Database> StateBuilder<DB> {
     }
 
     /// Sets the block hashes for the state.
-    pub fn with_block_hashes(self, block_hashes: BTreeMap<u64, B256>) -> Self {
+    pub fn with_block_hashes(self, block_hashes: Arc<BTreeMap<u64, B256>>) -> Self {
         Self {
             with_block_hashes: block_hashes,
             ..self

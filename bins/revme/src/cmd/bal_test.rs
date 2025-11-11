@@ -263,6 +263,7 @@ fn execute_blocks(
     debug: bool,
 ) -> u64 {
     let mut blocks_gas_used = vec![];
+    let block_hashes = Arc::new(block_hashes);
 
     let mut total_gas_used = 0;
     for (index, (block, (mut bal, cache))) in zip(blocks, zip(bals, caches)).into_iter().enumerate()
@@ -337,7 +338,7 @@ fn execute_blocks(
         for (tx_index, tx) in body.transactions.iter().enumerate() {
             let changes = handle_tx(
                 &block_env,
-                block_hashes.clone(),
+                Arc::clone(&block_hashes),
                 bal_arc.clone(),
                 cache.clone(),
                 tx_index as u64,
@@ -385,7 +386,7 @@ fn execute_blocks(
 
 fn handle_tx(
     block_env: &BlockEnv,
-    block_hashes: BTreeMap<u64, B256>,
+    block_hashes: Arc<BTreeMap<u64, B256>>,
     bal_arc: Arc<Bal>,
     cache: CacheState,
     tx_index: u64, // tx index start from 0, while the first tx's bal index is 1
@@ -453,6 +454,7 @@ fn execute_blocks_par(
     let mut total_gas_used = 0;
     let batch = cmd_env.batch_blocks;
 
+    let block_hashes = Arc::new(block_hashes);
     for (index, (blocks, (mut bals, (caches, txs_gas_used)))) in zip(
         blocks.chunks(batch),
         zip(
@@ -530,7 +532,7 @@ fn execute_blocks_par(
                 cmd_env,
                 &indexed_txs,
                 block_envs,
-                &block_hashes,
+                block_hashes.clone(),
                 bal_arcs,
                 caches,
             ),
@@ -538,7 +540,7 @@ fn execute_blocks_par(
                 cmd_env,
                 &indexed_txs,
                 block_envs,
-                &block_hashes,
+                block_hashes.clone(),
                 bal_arcs,
                 caches,
             ),
@@ -610,7 +612,7 @@ fn round_robin_schedule<'a>(
     cmd_env: &'a Cmd,
     indexed_txs: &'a Vec<(usize, EthereumTxEnvelope<TxEip4844>, usize, u64)>,
     block_envs: Vec<BlockEnv>,
-    block_hashes: &BTreeMap<u64, B256>,
+    block_hashes: Arc<BTreeMap<u64, B256>>,
     bal_arcs: Vec<Arc<Bal>>,
     caches: &'a [CacheState],
 ) -> Vec<(
@@ -679,7 +681,7 @@ fn channel_schedule<'a>(
     cmd_env: &'a Cmd,
     indexed_txs: &'a Vec<(usize, EthereumTxEnvelope<TxEip4844>, usize, u64)>,
     block_envs: Vec<BlockEnv>,
-    block_hashes: &BTreeMap<u64, B256>,
+    block_hashes: Arc<BTreeMap<u64, B256>>,
     bal_arcs: Vec<Arc<Bal>>,
     caches: &'a [CacheState],
 ) -> Vec<(

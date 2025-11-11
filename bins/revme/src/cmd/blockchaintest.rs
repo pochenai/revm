@@ -672,9 +672,9 @@ fn execute_blockchain_test(
     }
 
     // insert genesis hash
-    state
-        .block_hashes
-        .insert(0, test_case.genesis_block_header.hash);
+    // state
+    //     .block_hashes
+    //     .insert(0, test_case.genesis_block_header.hash);
 
     // Setup configuration based on fork
     let spec_id = fork_to_spec_id(test_case.network);
@@ -934,9 +934,9 @@ fn execute_blockchain_test(
         );
 
         // insert present block hash.
-        state
-            .block_hashes
-            .insert(block_env.number.to::<u64>(), block_hash.unwrap_or_default());
+        // state
+        //     .block_hashes
+        //     .insert(block_env.number.to::<u64>(), block_hash.unwrap_or_default());
 
         if let Some(bal) = state.bal_builder.take() {
             if let Some(state_bal) = state.bal.as_ref() {

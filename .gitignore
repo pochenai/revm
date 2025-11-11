@@ -32,3 +32,6 @@ rustc-ice-*
 *.txt
 # don't ignore in-memory state for others to reproduce
 !bins/revme/data/*_1.json  
+# profiling
+*.svg
+perf.data*
