@@ -3,7 +3,7 @@ use super::{
 };
 use bytecode::Bytecode;
 use database_interface::{DBErrorMarker, DatabaseRef};
-use primitives::{Address, HashMap, StorageKey, StorageValue, B256};
+use primitives::{hex::ToHexExt, Address, HashMap, StorageKey, StorageValue, B256};
 use state::{Account, AccountInfo, EvmState};
 use std::vec::Vec;
 
@@ -257,22 +257,22 @@ impl DatabaseRef for CacheState {
         // Account is already in cache
         if let Some(account) = self.accounts.get(&address) {
             return Ok(account.account_info());
-        } else {
-            return Err(MyError {
-                message: String::from("basic_ref error"),
-            });
         }
+        // return Err(MyError {
+        //     message: String::from("basic_ref error"),
+        // });
+        panic!("basic_ref error,addr:{:?}", address);
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         // Check if code is in cache
         if let Some(code) = self.contracts.get(&code_hash) {
             return Ok(code.clone());
-        } else {
-            return Err(MyError {
-                message: String::from("code_by_hash_ref error"),
-            });
         }
+        //   return Err(MyError {
+        //         message: String::from("code_by_hash_ref error"),
+        //     });
+        panic!("code_by_hash_ref error,codehash:{}", code_hash.encode_hex());
     }
 
     fn storage_ref(
@@ -294,9 +294,13 @@ impl DatabaseRef for CacheState {
                 }
             }
         }
-        return Err(MyError {
-            message: String::from("storage_ref error"),
-        });
+        // return Err(MyError {
+        //     message: String::from("storage_ref error"),
+        // });
+        panic!(
+            "storage_ref error,addr:{:?}, storagekey:{:?}",
+            address, index
+        );
     }
 
     fn block_hash_ref(&self, _: u64) -> Result<B256, Self::Error> {

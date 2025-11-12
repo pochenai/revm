@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, iter::zip, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    iter::zip,
+    sync::Arc,
+    time::Duration,
+};
 
 use crossbeam::channel::unbounded;
 
@@ -12,16 +17,16 @@ use revm::{
         BlockEnv,
     },
     context_interface::block::BlobExcessGasAndPrice,
-    database::{bal::BalDatabase, CacheState, State},
-    primitives::{address, alloy_primitives, hardfork::SpecId, Address, B256, U256},
+    database::{bal::BalDatabase, states::CacheAccount, CacheState, PlainAccount, State},
+    primitives::{address, alloy_primitives, hardfork::SpecId, Address, B256, KECCAK_EMPTY, U256},
     state::bal::Bal,
     Context, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
 };
 
-use alloy_consensus::{transaction::Recovered, EthereumTxEnvelope, Transaction, TxEip4844};
+use alloy_consensus::{transaction::Recovered, Block, EthereumTxEnvelope, Transaction, TxEip4844};
 
-use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
+use rayon::{iter::Either, prelude::*};
 
 use clap::{Parser, ValueEnum};
 use std::time::Instant;
@@ -88,6 +93,9 @@ pub struct Cmd {
     /// Batch size to process multiple blocks.
     #[arg(short = 'b', default_value_t = 1)]
     batch_blocks: usize,
+    /// Enable pre-tx state. Default: false (pre-block state + bal), --pre-tx-state: true (pre-tx-state without bal).
+    #[arg(long, default_value_t = false)]
+    pre_tx_state: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, Default)]
@@ -130,13 +138,16 @@ impl Cmd {
         // Push the file in revme/data directory
         let nblocks = self.nblocks;
         let recovered_blocks = import_struct(format!("./data/blocks_{nblocks}.json"));
-        let blocks = RecoveredBlockVec(recovered_blocks).into();
+        let blocks: Vec<alloy_consensus::Block<Recovered<EthereumTxEnvelope<TxEip4844>>>> =
+            RecoveredBlockVec(recovered_blocks).into();
 
         let bals: Vec<Bal> = import_struct(format!("./data/bals_{nblocks}.json"));
         let prestates = import_struct(format!("./data/prestates_{nblocks}.json"));
         let block_hashes = import_struct(format!("./data/blockHashes_{nblocks}.json"));
 
         let caches = prestates_to_cachedbs(prestates);
+
+        let prestates = caches_to_prestates(caches, &bals, &blocks, self.pre_tx_state);
 
         println!("start executing......");
         let task_name = format!("threads: {}, blocks: {},", self.threads, bals.len(),);
@@ -145,9 +156,9 @@ impl Cmd {
             task_name,
             if self.par {
                 let gasused = import_struct(format!("./data/gasused_{nblocks}.json"));
-                execute_blocks_par(blocks, bals, caches, block_hashes, gasused, self)
+                execute_blocks_par(blocks, bals, prestates, block_hashes, gasused, self)
             } else {
-                execute_blocks(blocks, bals, caches, block_hashes, self.debug)
+                execute_blocks(blocks, bals, prestates, block_hashes, self.debug)
             }
         );
 
@@ -161,16 +172,113 @@ impl Cmd {
     }
 }
 
+fn derive_pre_tx_states(pre_block_state: CacheState, bal: &Bal, len_txs: u64) -> Vec<CacheState> {
+    let mut res = vec![];
+    let mut pre_tx_state = pre_block_state;
+    for tx_index in 0..len_txs {
+        let bal_index = tx_index + 1;
+        let mut created_accounts: HashMap<Address, (CacheAccount, bool)> = HashMap::new();
+
+        for (addr, cached_acct) in &mut pre_tx_state.accounts {
+            let is_none = cached_acct.account.is_none();
+            let acct = if is_none {
+                let addr = *addr;
+                created_accounts.insert(addr, (CacheAccount::default(), false));
+                let (new_cached_acct, _) = created_accounts.get_mut(&addr).unwrap();
+                if new_cached_acct.account.is_none() {
+                    new_cached_acct.account = Some(PlainAccount::default());
+                }
+                new_cached_acct.account.as_mut().unwrap()
+            } else {
+                cached_acct.account.as_mut().unwrap()
+            };
+
+            let info = &mut acct.info;
+            let changed = bal.populate_account_info(*addr, bal_index, info).unwrap();
+
+            let storage = &mut acct.storage;
+            for (key, value) in storage {
+                bal.populate_storage_slot(*addr, bal_index, *key, value)
+                    .unwrap();
+            }
+
+            if is_none && changed {
+                let new_account = created_accounts.get_mut(addr).unwrap();
+                new_account.1 = changed;
+            }
+        }
+
+        // insert newly created accounts and contracts
+        for (addr, (mut cached_acct, created)) in created_accounts {
+            if created {
+                let acct = cached_acct.account.as_mut().unwrap();
+                let info = &mut acct.info;
+                if info.code_hash != KECCAK_EMPTY {
+                    pre_tx_state
+                        .contracts
+                        .insert(info.code_hash, info.code.clone().unwrap());
+                }
+
+                pre_tx_state.accounts.insert(addr, cached_acct);
+            }
+        }
+        res.push(pre_tx_state.clone());
+    }
+
+    res
+}
+
+fn full_pre_tx_states(
+    caches: Vec<CacheState>,
+    bals: &[Bal],
+    full_len_txs: Vec<u64>,
+) -> Vec<Vec<CacheState>> {
+    let mut res = vec![];
+    for (block_index, pre_block_state) in caches.into_iter().enumerate() {
+        let bal = &bals[block_index];
+        let len_txs = full_len_txs[block_index];
+        let pre_tx_states = derive_pre_tx_states(pre_block_state, bal, len_txs);
+
+        res.push(pre_tx_states);
+    }
+    res
+}
+
+fn caches_to_prestates<Tx>(
+    caches: Vec<CacheState>,
+    bals: &[Bal],
+    blocks: &Vec<Block<Tx>>,
+    pre_tx_state: bool,
+) -> Vec<Either<CacheState, Vec<CacheState>>> {
+    if pre_tx_state {
+        let mut full_len_txs = vec![];
+        for b in blocks.iter() {
+            full_len_txs.push(b.body.transactions.len() as u64);
+        }
+        let pre_tx_states = full_pre_tx_states(caches, &bals, full_len_txs);
+        pre_tx_states
+            .into_iter()
+            .map(|s| Either::Right(s))
+            .collect::<Vec<_>>()
+    } else {
+        caches
+            .into_iter()
+            .map(|s| Either::Left(s))
+            .collect::<Vec<_>>()
+    }
+}
+
 /// execute blocks sequentially
 fn execute_blocks(
     blocks: Vec<RethBlock>,
     bals: Vec<Bal>,
-    caches: Vec<CacheState>,
+    caches: Vec<Either<CacheState, Vec<CacheState>>>,
     block_hashes: BTreeMap<u64, B256>,
     debug: bool,
 ) -> u64 {
     let mut blocks_gas_used = vec![];
     let block_hashes = Arc::new(block_hashes);
+    let num_blocks = blocks.len();
 
     let mut total_clone_time = Duration::ZERO;
 
@@ -251,11 +359,16 @@ fn execute_blocks(
             let (elasped, (block_hashes_clone, bal_arc_clone)) = measure!(false, "clone", {
                 (Arc::clone(&block_hashes), bal_arc.clone())
             });
+            let (prestate, bal) = match &cache {
+                Either::Left(cache) => (cache, Some(bal_arc_clone)),
+                Either::Right(cache) => (&cache[tx_index], None),
+            };
+
             let changes = handle_tx(
                 &block_env,
                 block_hashes_clone,
-                bal_arc_clone,
-                &cache,
+                bal,
+                prestate,
                 tx_index as u64,
                 tx,
                 debug,
@@ -284,26 +397,30 @@ fn execute_blocks(
             bal.remove_first_last();
             bal.remove_at_address(&SYSTEM_CA_ADDRESSES);
             bal.accounts.sort_keys();
-            assert_eq!(
-                output_bals, bal,
-                "bals for tx {} in block {} is not equal",
-                index, block_env.number
-            );
+
+            if output_bals != bal {
+                write_data("bals-in.json", &bal);
+                write_data("bals-out.json", &output_bals);
+                panic!("bals for block {} is not equal", block_env.number)
+            }
 
             // write gas used
             blocks_gas_used.push(block_gas_used);
         }
     }
-    println!("total clone time:{:?}", total_clone_time);
-    println!("write block gas used!");
-    write_data("gasused.json", &blocks_gas_used);
+    // println!("total clone time:{:?}", total_clone_time);
+    // println!("write block gas used!");
+    write_data(
+        format!("gasused_{}.json", num_blocks).as_str(),
+        &blocks_gas_used,
+    );
     total_gas_used
 }
 
 fn handle_tx(
     block_env: &BlockEnv,
     block_hashes: Arc<BTreeMap<u64, B256>>,
-    bal_arc: Arc<Bal>,
+    bal_arc: Option<Arc<Bal>>,
     cache: &CacheState,
     tx_index: u64, // tx index start from 0, while the first tx's bal index is 1
     tx: &Recovered<EthereumTxEnvelope<TxEip4844>>,
@@ -323,7 +440,7 @@ fn handle_tx(
         .build();
     let mut state = BalDatabase::new(cached_state)
         .with_bal_builder()
-        .with_bal_option(Some(bal_arc));
+        .with_bal_option(bal_arc);
     state.bal_index = tx_index + 1;
 
     let blocknumber = block_env.number;
@@ -340,10 +457,12 @@ fn handle_tx(
     // );
     let exe_result = evm.transact(txenv);
     if exe_result.is_err() {
-        eprintln!("{:?}", exe_result.err());
+        eprintln!("{:?}", exe_result);
         panic!(
-            "execution error for block: {} tx: {}",
-            blocknumber, tx_index
+            "execution error for block: {} tx: {}, hash:{:?}",
+            blocknumber,
+            tx_index,
+            tx.hash()
         )
     }
     // must commit state changes, or bal builder will have nothing
@@ -359,7 +478,7 @@ fn handle_tx(
 fn execute_blocks_par(
     blocks: Vec<RethBlock>,
     bals: Vec<Bal>,
-    caches: Vec<CacheState>,
+    prestates: Vec<Either<CacheState, Vec<CacheState>>>,
     block_hashes: BTreeMap<u64, B256>,
     txs_gas_used: Vec<Vec<u64>>,
     cmd_env: &Cmd,
@@ -375,7 +494,7 @@ fn execute_blocks_par(
         blocks.chunks(batch),
         zip(
             bals.chunks(batch),
-            zip(caches.chunks(batch), txs_gas_used.chunks(batch)),
+            zip(prestates.chunks(batch), txs_gas_used.chunks(batch)),
         ),
     )
     .into_iter()
@@ -522,12 +641,12 @@ fn execute_blocks_par(
 }
 
 fn round_robin_schedule<'a>(
-    cmd_env: &'a Cmd,
+    cmd_env: &Cmd,
     indexed_txs: &'a Vec<(usize, Recovered<EthereumTxEnvelope<TxEip4844>>, usize, u64)>,
     block_envs: Vec<BlockEnv>,
     block_hashes: Arc<BTreeMap<u64, B256>>,
     bal_arcs: Vec<Arc<Bal>>,
-    caches: &'a [CacheState],
+    caches: &[Either<CacheState, Vec<CacheState>>],
 ) -> Vec<(
     u64,
     Option<Bal>,
@@ -553,22 +672,34 @@ fn round_robin_schedule<'a>(
                 // each thread {tid, tid+threads, tid+2*threads, ...}
                 let mut i = tid;
                 while i < indexed_txs.len() {
-                    let (index, tx, block_index, _) = &indexed_txs[i];
+                    let (tx_index, tx, block_index, _) = &indexed_txs[i];
+                    let (prestate, bal) = match &caches[*block_index] {
+                        Either::Left(cache) => (cache, Some(bal_arcs[*block_index].clone())),
+                        Either::Right(cache) => (&cache[*tx_index], None),
+                    };
+
                     let (elapsed, (bal, gas_used)) = measure!(
                         false,
-                        format!("tx {}", index),
+                        format!("tx {}", tx_index),
                         handle_tx(
                             &block_envs[*block_index],
                             block_hashes.clone(),
-                            bal_arcs[*block_index].clone(),
-                            &caches[*block_index],
-                            *index as u64,
+                            bal,
+                            prestate,
+                            *tx_index as u64,
                             tx,
                             debug,
                             cmd_env.par_7702,
                         )
                     );
-                    result.push((*index as u64 + 1, bal, elapsed, tx, block_index, gas_used));
+                    result.push((
+                        *tx_index as u64 + 1,
+                        bal,
+                        elapsed,
+                        tx,
+                        block_index,
+                        gas_used,
+                    ));
 
                     i += threads;
                 }
@@ -584,12 +715,12 @@ fn round_robin_schedule<'a>(
 
 // only a bit faster than manual round robin schedule.
 fn channel_schedule<'a>(
-    cmd_env: &'a Cmd,
+    cmd_env: &Cmd,
     indexed_txs: &'a Vec<(usize, Recovered<EthereumTxEnvelope<TxEip4844>>, usize, u64)>,
     block_envs: Vec<BlockEnv>,
     block_hashes: Arc<BTreeMap<u64, B256>>,
     bal_arcs: Vec<Arc<Bal>>,
-    caches: &'a [CacheState],
+    caches: &[Either<CacheState, Vec<CacheState>>],
 ) -> Vec<(
     u64,
     Option<Bal>,
@@ -619,16 +750,20 @@ fn channel_schedule<'a>(
     pool.install(|| {
         (0..threads).into_par_iter().for_each(|_| {
             // let task_receiver = task_receiver.iter().cloned();
-            while let Ok((index, tx, block_index, _)) = task_receiver.recv() {
+            while let Ok((tx_index, tx, block_index, _)) = task_receiver.recv() {
+                let (prestate, bal) = match &caches[*block_index] {
+                    Either::Left(cache) => (cache, Some(bal_arcs[*block_index].clone())),
+                    Either::Right(cache) => (&cache[*tx_index], None),
+                };
                 let (elapsed, (bal, gas_used)) = measure!(
                     false,
-                    format!("tx {}", index),
+                    format!("tx {}", tx_index),
                     handle_tx(
                         &block_envs[*block_index],
                         block_hashes.clone(),
-                        bal_arcs[*block_index].clone(),
-                        &caches[*block_index],
-                        *index as u64,
+                        bal,
+                        prestate,
+                        *tx_index as u64,
                         tx,
                         debug,
                         cmd_env.par_7702,
@@ -636,7 +771,14 @@ fn channel_schedule<'a>(
                 );
 
                 res_sender
-                    .send((*index as u64 + 1, bal, elapsed, tx, block_index, gas_used))
+                    .send((
+                        *tx_index as u64 + 1,
+                        bal,
+                        elapsed,
+                        tx,
+                        block_index,
+                        gas_used,
+                    ))
                     .expect("Failed to send result");
             }
         });
@@ -736,8 +878,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_exe_blocks() {
+    fn test_exe_blocks_with_state(pre_tx_state: bool) {
         let recovered_blocks = import_struct("./data/blocks_1.json");
         let blocks = RecoveredBlockVec(recovered_blocks).into();
         let bals: Vec<Bal> = import_struct("./data/bals_1.json");
@@ -746,13 +887,21 @@ mod tests {
 
         let caches = prestates_to_cachedbs(prestates);
 
-        execute_blocks(blocks, bals, caches, block_hashes, true);
+        let prestates = caches_to_prestates(caches, &bals, &blocks, pre_tx_state);
+
+        execute_blocks(blocks, bals, prestates, block_hashes, true);
     }
 
     #[test]
-    fn test_par_exe_blocks() {
+    fn test_exe_blocks() {
+        test_exe_blocks_with_state(false);
+        test_exe_blocks_with_state(true);
+    }
+
+    fn test_par_exe_blocks_state(pre_tx_state: bool) {
         let cwd = std::env::current_dir().unwrap();
-        let blocks = import_struct(cwd.join("./data/blocks_1.json"));
+        let recovered_blocks = import_struct("./data/blocks_1.json");
+        let blocks = RecoveredBlockVec(recovered_blocks).into();
         let bals: Vec<Bal> = import_struct(cwd.join("./data/bals_1.json"));
         let prestates = import_struct(cwd.join("./data/prestates_1.json"));
         let block_hashes = import_struct(cwd.join("./data/blockHashes_1.json"));
@@ -763,12 +912,21 @@ mod tests {
         cmd_env.threads = 5;
         cmd_env.check_bal = true;
         cmd_env.debug = true;
+        cmd_env.batch_blocks = 1;
+
+        let prestates = caches_to_prestates(caches, &bals, &blocks, pre_tx_state);
 
         let task_name = format!("threads: {}, blocks: {},", cmd_env.threads, bals.len(),);
         measure!(
             cmd_env.debug,
             task_name,
-            execute_blocks_par(blocks, bals, caches, block_hashes, gas_used, &cmd_env,)
+            execute_blocks_par(blocks, bals, prestates, block_hashes, gas_used, &cmd_env,)
         );
+    }
+
+    #[test]
+    fn test_par_exe_blocks() {
+        test_par_exe_blocks_state(false);
+        test_par_exe_blocks_state(true);
     }
 }
