@@ -5,7 +5,8 @@ use std::{any::Any, fs::File};
 use std::{fs, os};
 
 use crate::TxEnv;
-use alloy_consensus::{EthereumTxEnvelope, Header, Transaction, TxEip4844};
+use alloy_consensus::transaction::Recovered;
+use alloy_consensus::{BlockBody, EthereumTxEnvelope, Header, Transaction, TxEip4844};
 use bitvec::vec;
 use context_interface::block::{BlobExcessGasAndPrice, Block};
 use context_interface::either::Either;
@@ -19,7 +20,68 @@ use serde::{Deserialize, Serialize};
 use state::AccountInfo;
 
 ///
-pub type RethBlock = alloy_consensus::Block<EthereumTxEnvelope<TxEip4844>>;
+pub type RethBlock = alloy_consensus::Block<Recovered<EthereumTxEnvelope<TxEip4844>>>;
+
+///
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct RecoveredBlock<T = EthereumTxEnvelope<TxEip4844>> {
+    /// Block
+    block: SealedBlock<T>,
+    /// List of senders that match the transactions in the block
+    senders: Vec<Address>,
+}
+
+///
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SealedBlock<T, H = Header> {
+    /// Sealed Header.
+    header: SealedHeader<H>,
+    /// the block's body.
+    body: BlockBody<T, H>,
+}
+
+///
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SealedHeader<H = Header> {
+    header: H,
+}
+
+impl From<RecoveredBlock> for RethBlock {
+    fn from(b: RecoveredBlock) -> Self {
+        let recoverd_txs: Vec<_> = b
+            .block
+            .body
+            .transactions
+            .into_iter()
+            .enumerate()
+            .map(|(i, tx)| Recovered::new_unchecked(tx, b.senders[i]))
+            .collect();
+
+        RethBlock {
+            header: b.block.header.header,
+            body: BlockBody {
+                transactions: recoverd_txs,
+                ommers: b.block.body.ommers,
+                withdrawals: b.block.body.withdrawals,
+            },
+        }
+    }
+}
+
+/// Create a wrapper struct for Vec<RecoveredBlock>
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct RecoveredBlockVec(pub Vec<RecoveredBlock>);
+
+// Implement From for the wrapper struct
+impl From<RecoveredBlockVec> for Vec<RethBlock> {
+    fn from(recovered_block_vec: RecoveredBlockVec) -> Self {
+        recovered_block_vec
+            .0
+            .into_iter()
+            .map(|b| b.into())
+            .collect()
+    }
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 ///
@@ -91,9 +153,8 @@ fn prestate_to_cachedb(prestate: PreblockState) -> CacheState {
 }
 
 /// Convert json tx data to revm::TxEnv
-pub fn envelope_to_txenv(envelope: &EthereumTxEnvelope<TxEip4844>) -> TxEnv {
+pub fn envelope_to_txenv(envelope: &Recovered<EthereumTxEnvelope<TxEip4844>>) -> TxEnv {
     // Extract inner transaction
-    let sig_hash = envelope.signature_hash();
     let blob_hashes = if let Some(h) = envelope.blob_versioned_hashes() {
         h.into()
     } else {
@@ -107,11 +168,7 @@ pub fn envelope_to_txenv(envelope: &EthereumTxEnvelope<TxEip4844>) -> TxEnv {
 
     TxEnv {
         tx_type: envelope.tx_type() as u8,
-        caller: envelope
-            .signature()
-            .recover_address_from_prehash(&sig_hash)
-            .ok()
-            .unwrap(), // depends on your envelope source
+        caller: envelope.signer(),
         gas_limit: envelope.gas_limit(),
         gas_price: envelope.max_fee_per_gas(), // you can use effective gas price here if needed
         kind: envelope.kind(),
@@ -161,8 +218,11 @@ mod tests {
     fn test_import_block() {
         // relative directory is the current crate root
         let filename = "../../bins/revme/data/blocks_1.json";
-        let blocks: Vec<RethBlock> = import_struct(filename);
-        println!("{:?}", blocks)
+        let blocks: Vec<RecoveredBlock> = import_struct(filename);
+        let blocks = RecoveredBlockVec(blocks);
+        // println!("{:?}", blocks);
+        let recovered_block: Vec<RethBlock> = blocks.into();
+        println!("{:?}", recovered_block[0].body.transactions[0]);
     }
 
     #[test]

@@ -1,48 +1,24 @@
-use std::{
-    collections::BTreeMap,
-    default,
-    fmt::format,
-    iter::zip,
-    path::{self, PathBuf},
-    sync::{mpsc::channel, Arc},
-    time::Duration,
-};
+use std::{collections::BTreeMap, iter::zip, sync::Arc, time::Duration};
 
-use crossbeam::channel::{unbounded, Receiver, Sender};
+use crossbeam::channel::unbounded;
 
 use alloy_primitives::{bytes, Bytes};
-use k256::elliptic_curve::consts::{False, True};
 use revm::{
-    bytecode::bitvec::index,
     context::{
-        self,
         block_states::{
-            envelope_to_txenv, import_struct, prestates_to_cachedbs, write_data, PreblockState,
+            envelope_to_txenv, import_struct, prestates_to_cachedbs, write_data, RecoveredBlockVec,
             RethBlock,
         },
-        cfg::CfgEnv,
-        transaction::AccessList,
-        BlockEnv, ContextTr, TxEnv,
+        BlockEnv,
     },
     context_interface::block::BlobExcessGasAndPrice,
-    database::{
-        bal::{self, BalDatabase},
-        states::{cache, changes},
-        Cache, CacheState, State,
-    },
-    primitives::{
-        address, alloy_primitives, hardfork::SpecId, hex::FromHex, Address, HashMap, B256,
-        KECCAK_EMPTY, U256,
-    },
-    state::{
-        bal::{Bal, BalWrites},
-        Account, AccountInfo, Bytecode,
-    },
-    Context, Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
-    SystemCallEvm,
+    database::{bal::BalDatabase, CacheState, State},
+    primitives::{address, alloy_primitives, hardfork::SpecId, Address, B256, U256},
+    state::bal::Bal,
+    Context, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
 };
 
-use alloy_consensus::{EthereumTxEnvelope, Transaction, TxEip4844};
+use alloy_consensus::{transaction::Recovered, EthereumTxEnvelope, Transaction, TxEip4844};
 
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
@@ -153,19 +129,22 @@ impl Cmd {
     pub fn run(&self) -> Result<(), super::Error> {
         // Push the file in revme/data directory
         let nblocks = self.nblocks;
-        let blocks = import_struct(format!("./data/blocks_{nblocks}.json"));
+        let recovered_blocks = import_struct(format!("./data/blocks_{nblocks}.json"));
+        let blocks = RecoveredBlockVec(recovered_blocks).into();
+
         let bals: Vec<Bal> = import_struct(format!("./data/bals_{nblocks}.json"));
         let prestates = import_struct(format!("./data/prestates_{nblocks}.json"));
         let block_hashes = import_struct(format!("./data/blockHashes_{nblocks}.json"));
-        let gasused = import_struct(format!("./data/gasused_{nblocks}.json"));
 
         let caches = prestates_to_cachedbs(prestates);
 
+        println!("start executing......");
         let task_name = format!("threads: {}, blocks: {},", self.threads, bals.len(),);
         let (elapsed, gas_used) = measure!(
             true,
             task_name,
             if self.par {
+                let gasused = import_struct(format!("./data/gasused_{nblocks}.json"));
                 execute_blocks_par(blocks, bals, caches, block_hashes, gasused, self)
             } else {
                 execute_blocks(blocks, bals, caches, block_hashes, self.debug)
@@ -179,78 +158,6 @@ impl Cmd {
         );
 
         Ok(())
-    }
-}
-
-#[test]
-fn test_bal() {
-    let mut state = BalDatabase::new(State::builder().build()).with_bal_builder();
-    state.bal_index = 0;
-    let acct1 = AccountInfo {
-        balance: U256::MAX,
-        // Account nonce.
-        nonce: 0,
-        // Hash of the raw bytes in `code`, or [`KECCAK_EMPTY`].
-        code_hash: KECCAK_EMPTY,
-        // Storage id.
-        storage_id: None,
-        code: Some(Bytecode::default()),
-    };
-    let addr1 = Address::from_hex("0x4838B106FCe9647Bdf1E7877BF73cE8B0BAD5f97").unwrap();
-
-    let acct2 = AccountInfo {
-        balance: U256::ZERO,
-        // Account nonce.
-        nonce: 1,
-        // Hash of the raw bytes in `code`, or [`KECCAK_EMPTY`].
-        code_hash: KECCAK_EMPTY,
-        // Storage id.
-        storage_id: None,
-        code: Some(Bytecode::default()),
-    };
-    let addr2 = Address::from_hex("0xC6093Fd9cc143F9f058938868b2df2daF9A91d28").unwrap();
-
-    let mut genesis_state = BTreeMap::<Address, AccountInfo>::new();
-    genesis_state.insert(addr1, acct1);
-    genesis_state.insert(addr2, acct2);
-
-    for (address, account) in genesis_state {
-        state.insert_account_with_storage(address, account, HashMap::new());
-    }
-
-    let block_env = BlockEnv::default();
-    // Create EVM context for each transaction to ensure fresh state access
-    let evm_context = Context::mainnet()
-        .with_block(&block_env)
-        .with_db(&mut state);
-
-    let mut evm = evm_context.build_mainnet();
-    evm.db_mut().bal_index += 1;
-
-    let tx1 = TxEnv::builder_for_bench()
-        .caller(addr1)
-        .to(address!("0xc000000000000000000000000000000000000000"))
-        .value(U256::ONE)
-        .build_fill();
-    let exe_result = evm.transact(tx1).ok().unwrap();
-
-    evm.commit(exe_result.state);
-
-    evm.db_mut().bal_index += 1;
-    let mut acl = AccessList::default();
-    acl.add_address(address!("0x00000000000000000000000000000000000000ff"));
-    let tx2 = TxEnv::builder_for_bench()
-        .caller(address!("0x00000000000000000000000000000000000000ff"))
-        .access_list(acl)
-        .to(address!("0xc000000000000000000000000000000000000000"))
-        .build_fill();
-    let exe_result = evm.transact(tx2).ok().unwrap();
-
-    evm.commit(exe_result.state);
-
-    if let Some(bal) = state.bal_builder.take() {
-        println!("{}", serde_json::to_string_pretty(&bal).unwrap());
-        // println!("{:?}", bal);
     }
 }
 
@@ -289,11 +196,11 @@ fn execute_blocks(
         let bal_arc = Arc::new(bal_clone);
         total_clone_time += elasped;
 
-        let parent_hash = block.parent_hash;
-        let parent_beacon_root = block.parent_beacon_block_root.unwrap();
         let body = block.into_body();
 
         // // TODO: pre-tx bals
+        // let parent_hash = block.parent_hash;
+        // let parent_beacon_root = block.parent_beacon_block_root.unwrap();
         // let block_env_clone = block_env.clone();
         // let cached_state = State::builder()
         //     .with_block_hashes(block_hashes.clone())
@@ -388,8 +295,8 @@ fn execute_blocks(
         }
     }
     println!("total clone time:{:?}", total_clone_time);
-    // println!("write block gas used!");
-    // write_data("gas_used.json", &blocks_gas_used);
+    println!("write block gas used!");
+    write_data("gasused.json", &blocks_gas_used);
     total_gas_used
 }
 
@@ -399,7 +306,7 @@ fn handle_tx(
     bal_arc: Arc<Bal>,
     cache: &CacheState,
     tx_index: u64, // tx index start from 0, while the first tx's bal index is 1
-    tx: &EthereumTxEnvelope<TxEip4844>,
+    tx: &Recovered<EthereumTxEnvelope<TxEip4844>>,
     debug: bool,
     par_7702: bool,
 ) -> (Option<Bal>, u64) {
@@ -464,7 +371,7 @@ fn execute_blocks_par(
     let batch = cmd_env.batch_blocks;
 
     let block_hashes = Arc::new(block_hashes);
-    for (index, (blocks, (mut bals, (caches, txs_gas_used)))) in zip(
+    for (_, (blocks, (bals, (caches, txs_gas_used)))) in zip(
         blocks.chunks(batch),
         zip(
             bals.chunks(batch),
@@ -501,8 +408,6 @@ fn execute_blocks_par(
             block_envs.push(block_env);
             bal_arcs.push(Arc::new(bals[block_index].clone()));
 
-            let parent_hash = block.parent_hash;
-            let parent_beacon_root = block.parent_beacon_block_root.unwrap();
             let body = block.clone().into_body();
 
             for (tx_index, tx) in body.transactions.into_iter().enumerate() {
@@ -515,28 +420,27 @@ fn execute_blocks_par(
                 measure!(
                     false,
                     "sort_tx_ascending",
-                    indexed_txs.sort_by_key(|(_, tx, _, gas_used)| tx.gas_limit())
+                    indexed_txs.sort_by_key(|(_, tx, _, _)| tx.gas_limit())
                 );
             }
             PriorityOrder::GasLimitDescending => {
                 measure!(
                     false,
                     "sort_tx_descending",
-                    indexed_txs
-                        .sort_by_key(|(_, tx, _, gas_used)| std::cmp::Reverse(tx.gas_limit()))
+                    indexed_txs.sort_by_key(|(_, tx, _, _)| std::cmp::Reverse(tx.gas_limit()))
                 );
             }
             PriorityOrder::GasUsedDescending => {
                 measure!(
                     false,
                     "sort_tx_descending",
-                    indexed_txs.sort_by_key(|(_, tx, _, gas_used)| std::cmp::Reverse(*gas_used))
+                    indexed_txs.sort_by_key(|(_, _, _, gas_used)| std::cmp::Reverse(*gas_used))
                 );
             }
             PriorityOrder::None => { /* no sort */ }
         }
 
-        let mut results = match scheduler {
+        let results = match scheduler {
             Scheduler::RoundRobin => round_robin_schedule(
                 cmd_env,
                 &indexed_txs,
@@ -560,7 +464,7 @@ fn execute_blocks_par(
             let mut max_elapsed_idx = 0;
             let mut max_elapsed_tx = &indexed_txs[0].1;
             let mut max_block_index: usize = 0;
-            for (bal_index, _, elapsed, tx, block_index, gas_used) in &results {
+            for (bal_index, _, elapsed, tx, block_index, _gas_used) in &results {
                 if elapsed > &max_elapsed {
                     max_elapsed = *elapsed;
                     max_elapsed_idx = bal_index - 1;
@@ -619,7 +523,7 @@ fn execute_blocks_par(
 
 fn round_robin_schedule<'a>(
     cmd_env: &'a Cmd,
-    indexed_txs: &'a Vec<(usize, EthereumTxEnvelope<TxEip4844>, usize, u64)>,
+    indexed_txs: &'a Vec<(usize, Recovered<EthereumTxEnvelope<TxEip4844>>, usize, u64)>,
     block_envs: Vec<BlockEnv>,
     block_hashes: Arc<BTreeMap<u64, B256>>,
     bal_arcs: Vec<Arc<Bal>>,
@@ -628,7 +532,7 @@ fn round_robin_schedule<'a>(
     u64,
     Option<Bal>,
     Duration,
-    &'a EthereumTxEnvelope<TxEip4844>,
+    &'a Recovered<EthereumTxEnvelope<TxEip4844>>,
     &'a usize,
     u64,
 )> {
@@ -641,14 +545,7 @@ fn round_robin_schedule<'a>(
         .build()
         .expect("Failed to build Rayon pool");
 
-    let mut results: Vec<(
-        u64,
-        Option<Bal>,
-        Duration,
-        &EthereumTxEnvelope<TxEip4844>,
-        &usize,
-        u64,
-    )> = pool.install(|| {
+    let results: Vec<_> = pool.install(|| {
         let results: Vec<_> = (0..threads)
             .into_par_iter()
             .flat_map(|tid| {
@@ -688,7 +585,7 @@ fn round_robin_schedule<'a>(
 // only a bit faster than manual round robin schedule.
 fn channel_schedule<'a>(
     cmd_env: &'a Cmd,
-    indexed_txs: &'a Vec<(usize, EthereumTxEnvelope<TxEip4844>, usize, u64)>,
+    indexed_txs: &'a Vec<(usize, Recovered<EthereumTxEnvelope<TxEip4844>>, usize, u64)>,
     block_envs: Vec<BlockEnv>,
     block_hashes: Arc<BTreeMap<u64, B256>>,
     bal_arcs: Vec<Arc<Bal>>,
@@ -697,7 +594,7 @@ fn channel_schedule<'a>(
     u64,
     Option<Bal>,
     Duration,
-    &'a EthereumTxEnvelope<TxEip4844>,
+    &'a Recovered<EthereumTxEnvelope<TxEip4844>>,
     &'a usize,
     u64,
 )> {
@@ -751,37 +648,127 @@ fn channel_schedule<'a>(
     res_receiver.into_iter().collect()
 }
 
-#[test]
-fn test_exe_blocks() {
-    let blocks = import_struct("./data/blocks_1.json");
-    let bals: Vec<Bal> = import_struct("./data/bals_1.json");
-    let prestates = import_struct("./data/prestates_1.json");
-    let block_hashes = import_struct("./data/blockHashes_1.json");
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm::{
+        context::{
+            block_states::{import_struct, prestates_to_cachedbs},
+            transaction::AccessList,
+            BlockEnv, ContextTr, TxEnv,
+        },
+        database::{bal::BalDatabase, State},
+        primitives::{address, hex::FromHex, Address, HashMap, KECCAK_EMPTY, U256},
+        state::{bal::Bal, AccountInfo, Bytecode},
+        Context, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
+    };
+    use std::collections::BTreeMap;
 
-    let caches = prestates_to_cachedbs(prestates);
+    #[test]
+    fn test_bal() {
+        let mut state = BalDatabase::new(State::builder().build()).with_bal_builder();
+        state.bal_index = 0;
+        let acct1 = AccountInfo {
+            balance: U256::MAX,
+            // Account nonce.
+            nonce: 0,
+            // Hash of the raw bytes in `code`, or [`KECCAK_EMPTY`].
+            code_hash: KECCAK_EMPTY,
+            // Storage id.
+            storage_id: None,
+            code: Some(Bytecode::default()),
+        };
+        let addr1 = Address::from_hex("0x4838B106FCe9647Bdf1E7877BF73cE8B0BAD5f97").unwrap();
 
-    execute_blocks(blocks, bals, caches, block_hashes, true);
-}
+        let acct2 = AccountInfo {
+            balance: U256::ZERO,
+            // Account nonce.
+            nonce: 1,
+            // Hash of the raw bytes in `code`, or [`KECCAK_EMPTY`].
+            code_hash: KECCAK_EMPTY,
+            // Storage id.
+            storage_id: None,
+            code: Some(Bytecode::default()),
+        };
+        let addr2 = Address::from_hex("0xC6093Fd9cc143F9f058938868b2df2daF9A91d28").unwrap();
 
-#[test]
-fn test_par_exe_blocks() {
-    let cwd = std::env::current_dir().unwrap();
-    let blocks = import_struct(cwd.join("./data/blocks_1.json"));
-    let bals: Vec<Bal> = import_struct(cwd.join("./data/bals_1.json"));
-    let prestates = import_struct(cwd.join("./data/prestates_1.json"));
-    let block_hashes = import_struct(cwd.join("./data/blockHashes_1.json"));
-    let gas_used = import_struct(cwd.join("./data/gasused_1.json"));
+        let mut genesis_state = BTreeMap::<Address, AccountInfo>::new();
+        genesis_state.insert(addr1, acct1);
+        genesis_state.insert(addr2, acct2);
 
-    let caches = prestates_to_cachedbs(prestates);
-    let mut cmd_env = Cmd::default();
-    cmd_env.threads = 5;
-    cmd_env.check_bal = true;
-    cmd_env.debug = true;
+        for (address, account) in genesis_state {
+            state.insert_account_with_storage(address, account, HashMap::new());
+        }
 
-    let task_name = format!("threads: {}, blocks: {},", cmd_env.threads, bals.len(),);
-    measure!(
-        cmd_env.debug,
-        task_name,
-        execute_blocks_par(blocks, bals, caches, block_hashes, gas_used, &cmd_env,)
-    );
+        let block_env = BlockEnv::default();
+        // Create EVM context for each transaction to ensure fresh state access
+        let evm_context = Context::mainnet()
+            .with_block(&block_env)
+            .with_db(&mut state);
+
+        let mut evm = evm_context.build_mainnet();
+        evm.db_mut().bal_index += 1;
+
+        let tx1 = TxEnv::builder_for_bench()
+            .caller(addr1)
+            .to(address!("0xc000000000000000000000000000000000000000"))
+            .value(U256::ONE)
+            .build_fill();
+        let exe_result = evm.transact(tx1).ok().unwrap();
+
+        evm.commit(exe_result.state);
+
+        evm.db_mut().bal_index += 1;
+        let mut acl = AccessList::default();
+        acl.add_address(address!("0x00000000000000000000000000000000000000ff"));
+        let tx2 = TxEnv::builder_for_bench()
+            .caller(address!("0x00000000000000000000000000000000000000ff"))
+            .access_list(acl)
+            .to(address!("0xc000000000000000000000000000000000000000"))
+            .build_fill();
+        let exe_result = evm.transact(tx2).ok().unwrap();
+
+        evm.commit(exe_result.state);
+
+        if let Some(bal) = state.bal_builder.take() {
+            println!("{}", serde_json::to_string_pretty(&bal).unwrap());
+            // println!("{:?}", bal);
+        }
+    }
+
+    #[test]
+    fn test_exe_blocks() {
+        let recovered_blocks = import_struct("./data/blocks_1.json");
+        let blocks = RecoveredBlockVec(recovered_blocks).into();
+        let bals: Vec<Bal> = import_struct("./data/bals_1.json");
+        let prestates = import_struct("./data/prestates_1.json");
+        let block_hashes = import_struct("./data/blockHashes_1.json");
+
+        let caches = prestates_to_cachedbs(prestates);
+
+        execute_blocks(blocks, bals, caches, block_hashes, true);
+    }
+
+    #[test]
+    fn test_par_exe_blocks() {
+        let cwd = std::env::current_dir().unwrap();
+        let blocks = import_struct(cwd.join("./data/blocks_1.json"));
+        let bals: Vec<Bal> = import_struct(cwd.join("./data/bals_1.json"));
+        let prestates = import_struct(cwd.join("./data/prestates_1.json"));
+        let block_hashes = import_struct(cwd.join("./data/blockHashes_1.json"));
+        let gas_used = import_struct(cwd.join("./data/gasused_1.json"));
+
+        let caches = prestates_to_cachedbs(prestates);
+        let mut cmd_env = Cmd::default();
+        cmd_env.threads = 5;
+        cmd_env.check_bal = true;
+        cmd_env.debug = true;
+
+        let task_name = format!("threads: {}, blocks: {},", cmd_env.threads, bals.len(),);
+        measure!(
+            cmd_env.debug,
+            task_name,
+            execute_blocks_par(blocks, bals, caches, block_hashes, gas_used, &cmd_env,)
+        );
+    }
 }
