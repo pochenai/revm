@@ -177,35 +177,22 @@ fn derive_pre_tx_states(pre_block_state: CacheState, bal: &Bal, len_txs: u64) ->
     let mut pre_tx_state = pre_block_state;
     for tx_index in 0..len_txs {
         let bal_index = tx_index + 1;
-        // let mut created_accounts: HashMap<Address, (CacheAccount, bool)> = HashMap::new();
+        let mut created_accounts: HashMap<Address, (CacheAccount, bool)> = HashMap::new();
 
         for (addr, cached_acct) in &mut pre_tx_state.accounts {
-            // let is_none = cached_acct.account.is_none();
-            // if tx_index >= 76
-            //     && tx_index <= 79
-            //     && *addr == address!("0x380401acb31285facc71fc46e3ea3dd4166e342b")
-            // {
-            //     println!(
-            //         "bal_index:{}, acct is none:{:?}, acct:{:?}",
-            //         tx_index + 1,
-            //         is_none,
-            //         cached_acct.account
-            //     );
-            // }
-            // let acct = if is_none {
-            //     let addr = *addr;
-            //     created_accounts.insert(addr, (CacheAccount::default(), false));
-            //     let (new_cached_acct, _) = created_accounts.get_mut(&addr).unwrap();
-            //     if new_cached_acct.account.is_none() {
-            //         new_cached_acct.account = Some(PlainAccount::default());
-            //     }
-            //     new_cached_acct.account.as_mut().unwrap()
-            // } else {
-            //     cached_acct.account.as_mut().unwrap()
-            // };
-
-            // account will never be null because we've created a default account for newly created account that get read afterwards.
-            let acct = cached_acct.account.as_mut().unwrap();
+            // for some contracts that will be created later, we must set it as none before it's created.
+            let is_none = cached_acct.account.is_none();
+            let acct = if is_none {
+                let addr = *addr;
+                created_accounts.insert(addr, (CacheAccount::default(), false));
+                let (new_cached_acct, _) = created_accounts.get_mut(&addr).unwrap();
+                if new_cached_acct.account.is_none() {
+                    new_cached_acct.account = Some(PlainAccount::default());
+                }
+                new_cached_acct.account.as_mut().unwrap()
+            } else {
+                cached_acct.account.as_mut().unwrap()
+            };
 
             let info = &mut acct.info;
             let changed = bal.populate_account_info(*addr, bal_index, info).unwrap();
@@ -216,33 +203,27 @@ fn derive_pre_tx_states(pre_block_state: CacheState, bal: &Bal, len_txs: u64) ->
                     .unwrap();
             }
 
-            // if is_none && changed {
-            //     let new_account = created_accounts.get_mut(addr).unwrap();
-            //     new_account.1 = changed;
-            // }
+            if is_none && changed {
+                let new_account = created_accounts.get_mut(addr).unwrap();
+                new_account.1 = changed;
+            }
         }
 
         // insert newly created accounts and contracts
-        // for (addr, (mut cached_acct, created)) in created_accounts {
-        //     if created {
-        //         cached_acct.status = revm::database::AccountStatus::Loaded;
-        //         let acct = cached_acct.account.as_mut().unwrap();
-        //         let info = &mut acct.info;
-        //         if info.code_hash != KECCAK_EMPTY {
-        //             pre_tx_state
-        //                 .contracts
-        //                 .insert(info.code_hash, info.code.clone().unwrap());
-        //         }
+        for (addr, (mut cached_acct, created)) in created_accounts {
+            if created {
+                cached_acct.status = revm::database::AccountStatus::Loaded;
+                let acct = cached_acct.account.as_mut().unwrap();
+                let info = &mut acct.info;
+                if info.code_hash != KECCAK_EMPTY {
+                    pre_tx_state
+                        .contracts
+                        .insert(info.code_hash, info.code.clone().unwrap());
+                }
 
-        //         pre_tx_state.accounts.insert(addr, cached_acct);
-        //     }
-        // }
-
-        // if tx_index >= 76 {
-        //     let addr = address!("0x380401acb31285facc71fc46e3ea3dd4166e342b");
-        //     let acct = pre_tx_state.accounts.get(&addr);
-        //     println!("bal_index:{}, acct:{:?}", tx_index + 1, acct);
-        // }
+                pre_tx_state.accounts.insert(addr, cached_acct);
+            }
+        }
         res.push(pre_tx_state.clone());
     }
 
@@ -429,11 +410,10 @@ fn execute_blocks(
             // write gas used
             blocks_gas_used.push(block_gas_used);
         }
-
         println!("block execution:{} done", bn);
     }
-    // println!("total clone time:{:?}", total_clone_time);
-    // println!("write block gas used!");
+    println!("total clone time:{:?}", total_clone_time);
+    println!("write block gas used!");
     write_data(
         format!("gasused_{}.json", num_blocks).as_str(),
         &blocks_gas_used,
@@ -903,7 +883,7 @@ mod tests {
     }
 
     fn test_exe_blocks_with_state(pre_tx_state: bool) {
-        let bn = 2;
+        let bn = 1;
         let recovered_blocks = import_struct(format!("./data/blocks_{bn}.json"));
         let blocks = RecoveredBlockVec(recovered_blocks).into();
         let bals: Vec<Bal> = import_struct(format!("./data/bals_{bn}.json"));
@@ -919,7 +899,7 @@ mod tests {
 
     #[test]
     fn test_exe_blocks() {
-        // test_exe_blocks_with_state(false);
+        test_exe_blocks_with_state(false);
         test_exe_blocks_with_state(true);
     }
 

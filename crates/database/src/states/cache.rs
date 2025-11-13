@@ -254,9 +254,14 @@ impl DatabaseRef for CacheState {
     type Error = MyError;
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        // Account is already in cache
+        // Account is already in prestate provider.
         if let Some(account) = self.accounts.get(&address) {
-            return Ok(account.account_info());
+            // special handle for contract creatation.
+            if account.account.as_ref().unwrap().info.is_empty() {
+                return Ok(None);
+            } else {
+                return Ok(account.account_info());
+            }
         }
         // return Err(MyError {
         //     message: String::from("basic_ref error"),
@@ -265,7 +270,7 @@ impl DatabaseRef for CacheState {
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        // Check if code is in cache
+        // Check if code is in prestate provider.
         if let Some(code) = self.contracts.get(&code_hash) {
             return Ok(code.clone());
         }
@@ -280,7 +285,7 @@ impl DatabaseRef for CacheState {
         address: Address,
         index: StorageKey,
     ) -> Result<StorageValue, Self::Error> {
-        // Check if account is in cache, the account is not guaranteed to be loaded
+        // Check if account is in prestate provider, the account is not guaranteed to be loaded
         if let Some(account) = self.accounts.get(&address) {
             if let Some(plain_account) = &account.account {
                 // If storage is known, we can return it
