@@ -131,7 +131,11 @@ fn prestate_to_cachedb(prestate: PreblockState) -> CacheState {
                 storage: acct.storage,
             })
         } else {
-            None
+            // some newly created account't doesn't have account info, but will read some other slots.
+            Some(PlainAccount {
+                info: AccountInfo::default(),
+                storage: acct.storage,
+            })
         };
 
         // insert code

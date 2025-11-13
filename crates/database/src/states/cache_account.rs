@@ -7,7 +7,7 @@ use state::AccountInfo;
 
 /// Cache account contains plain state that gets updated
 /// at every transaction when evm output is applied to CacheState.
-#[derive(Clone, Debug, Default,PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CacheAccount {
     /// Account information and storage, if account exists.
     pub account: Option<PlainAccount>,
