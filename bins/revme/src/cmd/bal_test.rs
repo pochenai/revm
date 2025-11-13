@@ -156,7 +156,7 @@ impl Cmd {
             task_name,
             if self.par {
                 let gasused = import_struct(format!("./data/gasused_{nblocks}.json"));
-                execute_blocks_par(blocks, bals, prestates, block_hashes, gasused, self)
+                execute_blocks_par_scheduler(blocks, bals, prestates, block_hashes, gasused, self)
             } else {
                 execute_blocks(blocks, bals, prestates, block_hashes, self.debug)
             }
@@ -180,8 +180,9 @@ fn derive_pre_tx_states(pre_block_state: CacheState, bal: &Bal, len_txs: u64) ->
         let mut created_accounts: HashMap<Address, (CacheAccount, bool)> = HashMap::new();
 
         for (addr, cached_acct) in &mut pre_tx_state.accounts {
-            // for some contracts that will be created later, we must set it as none before it's created.
+            // for some contracts that will be created later, we must set it as none before it's created or the gas cost will be wrong due to the account exists check.
             let is_none = cached_acct.account.is_none();
+            // contract created, https://etherscan.io/tx/0x11dd9d8d64bd0cfe39c1644b8a68fce33f9eb101aa4aa4af8794644764f2b4fb
             let acct = if is_none {
                 let addr = *addr;
                 created_accounts.insert(addr, (CacheAccount::default(), false));
@@ -210,6 +211,9 @@ fn derive_pre_tx_states(pre_block_state: CacheState, bal: &Bal, len_txs: u64) ->
         }
 
         // insert newly created accounts and contracts
+        // e.g: create contract then use it in the same block.
+        // https://etherscan.io/tx/0xbe0bec6662d53c30c49e82bcf867ca099dccdb85053211931a3a4dc53a2b4046
+        // https://etherscan.io/tx/0x0240b04e544ed2808fd8a47d05f58e33a38be1f7312d1ba3f3ab8fb2f1be9847
         for (addr, (mut cached_acct, created)) in created_accounts {
             if created {
                 cached_acct.status = revm::database::AccountStatus::Loaded;
@@ -479,7 +483,7 @@ fn handle_tx(
 }
 
 /// execute blocks sequentially
-fn execute_blocks_par(
+fn execute_blocks_par_scheduler(
     blocks: Vec<RethBlock>,
     bals: Vec<Bal>,
     prestates: Vec<Either<CacheState, Vec<CacheState>>>,
@@ -926,7 +930,7 @@ mod tests {
         measure!(
             cmd_env.debug,
             task_name,
-            execute_blocks_par(blocks, bals, prestates, block_hashes, gas_used, &cmd_env,)
+            execute_blocks_par_scheduler(blocks, bals, prestates, block_hashes, gas_used, &cmd_env,)
         );
     }
 
