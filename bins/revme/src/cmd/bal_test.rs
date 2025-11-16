@@ -154,6 +154,13 @@ impl Cmd {
         // preload kzg trusted setup
         init_load_kzg_trusted_setup();
 
+        // set global threads number
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(self.threads)
+            .thread_name(|i| format!("rayon-{}", i))
+            .build_global()
+            .unwrap();
+
         println!("start executing......");
         let task_name = format!("threads: {}, blocks: {},", self.threads, bals.len(),);
         let (elapsed, gas_used) = measure!(
