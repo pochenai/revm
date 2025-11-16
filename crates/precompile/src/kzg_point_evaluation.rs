@@ -45,6 +45,8 @@ pub fn run(input: &[u8], gas_limit: u64) -> PrecompileResult {
         return Err(PrecompileError::OutOfGas);
     }
 
+    // println!("KZG Point Evaluation Precompile");
+
     // Verify input length.
     if input.len() != 192 {
         return Err(PrecompileError::BlobInvalidInputLength);

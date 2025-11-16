@@ -387,6 +387,7 @@ fn execute_blocks(
         let mut results = Vec::with_capacity(body.transactions.len());
 
         for (tx_index, tx) in body.transactions.iter().enumerate() {
+            println!("executing block:{} tx:{}, txhash:{}", bn, tx_index, tx.hash());
             let (elasped, (block_hashes_clone, bal_ref)) =
                 measure!(false, "clone", { (Arc::clone(&block_hashes), bal_ref) });
             let (prestate, bal) = match &cache {
