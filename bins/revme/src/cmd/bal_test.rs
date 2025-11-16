@@ -18,6 +18,7 @@ use revm::{
     },
     context_interface::block::{self, BlobExcessGasAndPrice},
     database::{bal::BalDatabase, states::CacheAccount, CacheState, PlainAccount, State},
+    precompile::kzg_point_evaluation::init_load_kzg_trusted_setup,
     primitives::{address, alloy_primitives, hardfork::SpecId, Address, B256, KECCAK_EMPTY, U256},
     state::bal::Bal,
     Context, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
@@ -149,6 +150,9 @@ impl Cmd {
         let caches = prestates_to_cachedbs(prestates);
 
         let prestates = caches_to_prestates(caches, &bals, &blocks, self.pre_tx_state);
+
+        // preload kzg trusted setup
+        init_load_kzg_trusted_setup();
 
         println!("start executing......");
         let task_name = format!("threads: {}, blocks: {},", self.threads, bals.len(),);

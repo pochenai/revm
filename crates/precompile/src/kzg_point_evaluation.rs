@@ -1,5 +1,7 @@
 //! KZG point evaluation precompile added in [`EIP-4844`](https://eips.ethereum.org/EIPS/eip-4844)
 //! For more details check [`run`] function.
+use std::time::Instant;
+
 use crate::{
     crypto, Address, Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult,
 };
@@ -8,6 +10,7 @@ pub mod arkworks;
 #[cfg(feature = "blst")]
 pub mod blst;
 
+use c_kzg::KzgSettings;
 use primitives::hex_literal::hex;
 
 /// KZG point evaluation precompile, containing address and function to run.
@@ -73,6 +76,17 @@ pub fn kzg_to_versioned_hash(commitment: &[u8]) -> [u8; 32] {
     hash
 }
 
+/// global KZG_SETTINGS
+pub static KZG_SETTINGS: std::sync::LazyLock<&'static KzgSettings> =
+    std::sync::LazyLock::new(|| c_kzg::ethereum_kzg_settings(8));
+
+/// initialize kzg setting at start
+pub fn init_load_kzg_trusted_setup() {
+    let start = Instant::now();
+    std::sync::LazyLock::force(&KZG_SETTINGS);
+    println!("kzg load_trusted_setup overhead:{:?}", start.elapsed());
+}
+
 /// Verify KZG proof.
 #[inline]
 pub fn verify_kzg_proof(
@@ -81,6 +95,8 @@ pub fn verify_kzg_proof(
     y: &[u8; 32],
     proof: &[u8; 48],
 ) -> bool {
+    // blst::verify_kzg_proof(commitment, z, y, proof)
+    // arkworks::verify_kzg_proof(commitment, z, y, proof)
     cfg_if::cfg_if! {
         if #[cfg(feature = "c-kzg")] {
             use c_kzg::{Bytes48, Bytes32};
@@ -88,8 +104,9 @@ pub fn verify_kzg_proof(
             let as_bytes48 = |bytes: &[u8; 48]| -> &Bytes48 { unsafe { &*bytes.as_ptr().cast() } };
             let as_bytes32 = |bytes: &[u8; 32]| -> &Bytes32 { unsafe { &*bytes.as_ptr().cast() } };
 
-            let kzg_settings = c_kzg::ethereum_kzg_settings(8);
-            kzg_settings.verify_kzg_proof(as_bytes48(commitment), as_bytes32(z), as_bytes32(y), as_bytes48(proof)).unwrap_or(false)
+            // let kzg_settings = c_kzg::ethereum_kzg_settings(8);
+            // kzg_settings.verify_kzg_proof(as_bytes48(commitment), as_bytes32(z), as_bytes32(y), as_bytes48(proof)).unwrap_or(false)
+            KZG_SETTINGS.verify_kzg_proof(as_bytes48(commitment), as_bytes32(z), as_bytes32(y), as_bytes48(proof)).unwrap_or(false)
         } else if #[cfg(feature = "blst")] {
             blst::verify_kzg_proof(commitment, z, y, proof)
         } else {
