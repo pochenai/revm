@@ -717,13 +717,12 @@ fn execute_blockchain_test(
             this_excess_blob_gas = None;
         }
 
-        let bal_test = block
-            .block_access_list
-            .as_ref()
-            .and_then(|bal| Bal::try_from(bal.clone()).ok())
-            .map(Arc::new);
+        // let bal_test = block
+        //     .block_access_list
+        //     .as_ref()
+        //     .and_then(|bal| Bal::try_from(bal.clone()).ok());
 
-        state = state.with_bal_option(bal_test).reset_bal_index();
+        // state = state.with_bal_option(bal_test.as_ref()).reset_bal_index();
 
         // Create EVM context for each transaction to ensure fresh state access
         let evm_context = Context::mainnet()
@@ -940,7 +939,7 @@ fn execute_blockchain_test(
 
         if let Some(bal) = state.bal_builder.take() {
             if let Some(state_bal) = state.bal.as_ref() {
-                if &bal != state_bal.as_ref() {
+                if &&bal != state_bal {
                     println!("Bal mismatch");
                     println!("Test bal");
                     state_bal.pretty_print();

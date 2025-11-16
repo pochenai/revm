@@ -16,7 +16,7 @@ use revm::{
         },
         BlockEnv,
     },
-    context_interface::block::BlobExcessGasAndPrice,
+    context_interface::block::{self, BlobExcessGasAndPrice},
     database::{bal::BalDatabase, states::CacheAccount, CacheState, PlainAccount, State},
     primitives::{address, alloy_primitives, hardfork::SpecId, Address, B256, KECCAK_EMPTY, U256},
     state::bal::Bal,
@@ -79,7 +79,7 @@ pub struct Cmd {
     #[arg(short = 'n', default_value_t = 1)]
     nblocks: u64,
     /// Process txs prioritized by gas used or limit order, "gasUsedDo":gas used descending order, "gasLimitDo": gas limit descending order, "ao": gas limit ascending order, "none": random shedule.
-    #[arg(short = 's', value_enum, default_value = "gasUsedDo")]
+    #[arg(short = 's', value_enum, default_value = "none")]
     schedule_by_gaslimit: PriorityOrder,
     /// Enable showing debug info.
     #[arg(short = 'd', default_value_t = false)]
@@ -112,6 +112,7 @@ pub enum PriorityOrder {
     GasLimitAscending,
 
     /// Do not sort by gas limit.
+    #[clap(alias = "none")]
     None,
 }
 
@@ -156,7 +157,19 @@ impl Cmd {
             task_name,
             if self.par {
                 let gasused = import_struct(format!("./data/gasused_{nblocks}.json"));
-                execute_blocks_par_scheduler(blocks, bals, prestates, block_hashes, gasused, self)
+                match self.schedule_by_gaslimit {
+                    PriorityOrder::None => {
+                        execute_blocks_par(blocks, bals, prestates, block_hashes, gasused, self)
+                    }
+                    _ => execute_blocks_par_scheduler(
+                        blocks,
+                        bals,
+                        prestates,
+                        block_hashes,
+                        gasused,
+                        self,
+                    ),
+                }
             } else {
                 execute_blocks(blocks, bals, prestates, block_hashes, self.debug)
             }
@@ -307,7 +320,7 @@ fn execute_blocks(
         };
 
         let (elasped, bal_clone) = measure!(false, "bal_clone", bal.clone());
-        let bal_arc = Arc::new(bal_clone);
+        let bal_ref = &bal;
         total_clone_time += elasped;
         let bn = block.number;
 
@@ -363,11 +376,10 @@ fn execute_blocks(
         let mut results = Vec::with_capacity(body.transactions.len());
 
         for (tx_index, tx) in body.transactions.iter().enumerate() {
-            let (elasped, (block_hashes_clone, bal_arc_clone)) = measure!(false, "clone", {
-                (Arc::clone(&block_hashes), bal_arc.clone())
-            });
+            let (elasped, (block_hashes_clone, bal_ref)) =
+                measure!(false, "clone", { (Arc::clone(&block_hashes), bal_ref) });
             let (prestate, bal) = match &cache {
-                Either::Left(cache) => (cache, Some(bal_arc_clone)),
+                Either::Left(cache) => (cache, Some(bal_ref)),
                 Either::Right(cache) => (&cache[tx_index], None),
             };
 
@@ -428,7 +440,7 @@ fn execute_blocks(
 fn handle_tx(
     block_env: &BlockEnv,
     block_hashes: Arc<BTreeMap<u64, B256>>,
-    bal_arc: Option<Arc<Bal>>,
+    bal_ref: Option<&Bal>,
     cache: &CacheState,
     tx_index: u64, // tx index start from 0, while the first tx's bal index is 1
     tx: &Recovered<EthereumTxEnvelope<TxEip4844>>,
@@ -448,7 +460,7 @@ fn handle_tx(
         .build();
     let mut state = BalDatabase::new(cached_state)
         .with_bal_builder()
-        .with_bal_option(bal_arc);
+        .with_bal_option(bal_ref);
     state.bal_index = tx_index + 1;
 
     let blocknumber = block_env.number;
@@ -482,7 +494,11 @@ fn handle_tx(
     // print!("exe_result:{:?}", exe_result)
 }
 
-/// execute blocks sequentially
+static mut SCHEDULER_OVERHEAD: Duration = Duration::ZERO;
+static mut SCHEDULER_SENDER_OVERHEAD: Duration = Duration::ZERO;
+static mut EXECUTION: Duration = Duration::ZERO;
+
+/// execute blocks parallel with scheduler
 fn execute_blocks_par_scheduler(
     blocks: Vec<RethBlock>,
     bals: Vec<Bal>,
@@ -508,10 +524,11 @@ fn execute_blocks_par_scheduler(
     .into_iter()
     .enumerate()
     {
+        let start = Instant::now();
         let mut indexed_txs = vec![];
 
         let mut block_envs = Vec::with_capacity(blocks.len());
-        let mut bal_arcs = Vec::with_capacity(blocks.len());
+        let mut bal_refs = Vec::with_capacity(blocks.len());
 
         for (block_index, (block, block_txs_gas_used)) in
             zip(blocks, txs_gas_used).into_iter().enumerate()
@@ -533,7 +550,7 @@ fn execute_blocks_par_scheduler(
             };
 
             block_envs.push(block_env);
-            bal_arcs.push(Arc::new(bals[block_index].clone()));
+            bal_refs.push(&bals[block_index]);
 
             let body = block.clone().into_body();
 
@@ -567,13 +584,18 @@ fn execute_blocks_par_scheduler(
             PriorityOrder::None => { /* no sort */ }
         }
 
+        unsafe {
+            SCHEDULER_OVERHEAD += start.elapsed();
+        }
+
+        let exe_start = Instant::now();
         let results = match scheduler {
             Scheduler::RoundRobin => round_robin_schedule(
                 cmd_env,
                 &indexed_txs,
                 block_envs,
                 block_hashes.clone(),
-                bal_arcs,
+                bal_refs,
                 caches,
             ),
             Scheduler::ConsumerProducer => channel_schedule(
@@ -581,7 +603,7 @@ fn execute_blocks_par_scheduler(
                 &indexed_txs,
                 block_envs,
                 block_hashes.clone(),
-                bal_arcs,
+                bal_refs,
                 caches,
             ),
         };
@@ -636,6 +658,10 @@ fn execute_blocks_par_scheduler(
                 // }
             }
         }
+
+        unsafe {
+            EXECUTION += exe_start.elapsed();
+        }
     }
 
     if debug {
@@ -645,6 +671,123 @@ fn execute_blocks_par_scheduler(
         );
     }
 
+    unsafe {
+        println!(
+            "pre-process:{:?}, task-sender:{:?}, execution:{:?}",
+            SCHEDULER_OVERHEAD, SCHEDULER_SENDER_OVERHEAD, EXECUTION
+        );
+    }
+
+    total_gas_used
+}
+
+fn execute_blocks_par(
+    blocks: Vec<RethBlock>,
+    bals: Vec<Bal>,
+    prestates: Vec<Either<CacheState, Vec<CacheState>>>,
+    block_hashes: BTreeMap<u64, B256>,
+    txs_gas_used: Vec<Vec<u64>>,
+    cmd_env: &Cmd,
+) -> u64 {
+    let debug = cmd_env.debug;
+    let mut total_gas_used = 0;
+    let batch = cmd_env.batch_blocks;
+
+    let block_hashes = Arc::new(block_hashes);
+    for (_, (blocks, (bals, (caches, txs_gas_used)))) in zip(
+        blocks.chunks(batch),
+        zip(
+            bals.chunks(batch),
+            zip(prestates.chunks(batch), txs_gas_used.chunks(batch)),
+        ),
+    )
+    .into_iter()
+    .enumerate()
+    {
+        let chunk_results = blocks
+            .par_iter()
+            .enumerate()
+            .flat_map(|(i, block)| {
+                let block_env = BlockEnv {
+                    number: U256::from(block.number),
+                    beneficiary: block.beneficiary,
+                    timestamp: U256::from(block.timestamp),
+                    gas_limit: block.gas_limit,
+                    basefee: block.base_fee_per_gas.unwrap(),
+                    difficulty: block.difficulty,
+                    prevrandao: Some(block.mix_hash),
+                    blob_excess_gas_and_price: Some(BlobExcessGasAndPrice::new_with_spec(
+                        block.excess_blob_gas.unwrap(),
+                        SpecId::PRAGUE,
+                    )),
+                };
+
+                let bal_ref = &bals[i];
+                let cache = &caches[i];
+
+                let results = block
+                    .body
+                    .transactions
+                    .par_iter()
+                    .enumerate()
+                    .map(|(tx_index, tx)| {
+                        let (prestate, bal) = match cache {
+                            Either::Left(cache) => (cache, Some(bal_ref)),
+                            Either::Right(cache) => (&cache[tx_index], None),
+                        };
+
+                        let (elapsed, (bal, gas_used)) = measure!(
+                            false,
+                            format!("tx {}", tx_index),
+                            handle_tx(
+                                &block_env,
+                                block_hashes.clone(),
+                                bal,
+                                prestate,
+                                tx_index as u64,
+                                tx,
+                                debug,
+                                cmd_env.par_7702,
+                            )
+                        );
+                        // collect bal cause huge memeory allocation thus decrease performance about 8%.
+                        (tx_index as u64 + 1, 0, elapsed, tx, i, gas_used)
+                    })
+                    .collect::<Vec<_>>();
+                results
+            })
+            .collect::<Vec<_>>();
+
+        if debug {
+            let mut max_elapsed = Duration::ZERO;
+            let mut max_elapsed_idx = 0;
+            let mut max_elapsed_tx = &chunk_results[0].3;
+            let mut max_block_index: usize = 0;
+            for (bal_index, _, elapsed, tx, block_index, _gas_used) in &chunk_results {
+                if elapsed > &max_elapsed {
+                    max_elapsed = *elapsed;
+                    max_elapsed_idx = bal_index - 1;
+                    max_elapsed_tx = tx;
+                    max_block_index = *block_index;
+                }
+            }
+
+            if max_elapsed > Duration::from_millis(10) {
+                println!(
+                    "Block {} → tx #{} (0-based index), type:{},hash:{}, took the longest: {:?}",
+                    max_block_index,
+                    max_elapsed_idx,
+                    max_elapsed_tx.tx_type(),
+                    max_elapsed_tx.hash(),
+                    max_elapsed
+                );
+            }
+        }
+    }
+
+    for block in blocks.iter() {
+        total_gas_used += block.gas_used;
+    }
     total_gas_used
 }
 
@@ -653,7 +796,7 @@ fn round_robin_schedule<'a>(
     indexed_txs: &'a Vec<(usize, Recovered<EthereumTxEnvelope<TxEip4844>>, usize, u64)>,
     block_envs: Vec<BlockEnv>,
     block_hashes: Arc<BTreeMap<u64, B256>>,
-    bal_arcs: Vec<Arc<Bal>>,
+    bal_arcs: Vec<&Bal>,
     caches: &[Either<CacheState, Vec<CacheState>>],
 ) -> Vec<(
     u64,
@@ -682,7 +825,7 @@ fn round_robin_schedule<'a>(
                 while i < indexed_txs.len() {
                     let (tx_index, tx, block_index, _) = &indexed_txs[i];
                     let (prestate, bal) = match &caches[*block_index] {
-                        Either::Left(cache) => (cache, Some(bal_arcs[*block_index].clone())),
+                        Either::Left(cache) => (cache, Some(bal_arcs[*block_index])),
                         Either::Right(cache) => (&cache[*tx_index], None),
                     };
 
@@ -727,7 +870,7 @@ fn channel_schedule<'a>(
     indexed_txs: &'a Vec<(usize, Recovered<EthereumTxEnvelope<TxEip4844>>, usize, u64)>,
     block_envs: Vec<BlockEnv>,
     block_hashes: Arc<BTreeMap<u64, B256>>,
-    bal_arcs: Vec<Arc<Bal>>,
+    bal_arcs: Vec<&Bal>,
     caches: &[Either<CacheState, Vec<CacheState>>],
 ) -> Vec<(
     u64,
@@ -737,6 +880,7 @@ fn channel_schedule<'a>(
     &'a usize,
     u64,
 )> {
+    let start = Instant::now();
     let threads = cmd_env.threads;
     let debug = cmd_env.debug;
     // Build thread pool
@@ -752,6 +896,10 @@ fn channel_schedule<'a>(
     }
     drop(task_sender); // close sender so workers know when finished
 
+    unsafe {
+        SCHEDULER_SENDER_OVERHEAD += start.elapsed();
+    }
+
     // Result channel
     let (res_sender, res_receiver) = unbounded();
 
@@ -760,7 +908,7 @@ fn channel_schedule<'a>(
             // let task_receiver = task_receiver.iter().cloned();
             while let Ok((tx_index, tx, block_index, _)) = task_receiver.recv() {
                 let (prestate, bal) = match &caches[*block_index] {
-                    Either::Left(cache) => (cache, Some(bal_arcs[*block_index].clone())),
+                    Either::Left(cache) => (cache, Some(bal_arcs[*block_index])),
                     Either::Right(cache) => (&cache[*tx_index], None),
                 };
                 let (elapsed, (bal, gas_used)) = measure!(

@@ -16,10 +16,10 @@ use crate::{DBErrorMarker, Database, DatabaseCommit};
 
 /// Database implementation for BAL.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct BalDatabase<DB> {
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct BalDatabase<'a, DB> {
     /// BAL used to execute transactions.
-    pub bal: Option<Arc<Bal>>,
+    pub bal: Option<&'a Bal>,
     /// BAL builder that is used to build BAL.
     /// It is create from State output of transaction execution.
     pub bal_builder: Option<Bal>,
@@ -31,7 +31,7 @@ pub struct BalDatabase<DB> {
     pub changes: EvmState,
 }
 
-impl<DB> Deref for BalDatabase<DB> {
+impl<'a, DB> Deref for BalDatabase<'a, DB> {
     type Target = DB;
 
     fn deref(&self) -> &Self::Target {
@@ -39,13 +39,13 @@ impl<DB> Deref for BalDatabase<DB> {
     }
 }
 
-impl<DB> DerefMut for BalDatabase<DB> {
+impl<'a, DB> DerefMut for BalDatabase<'a, DB> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.db
     }
 }
 
-impl<DB> BalDatabase<DB> {
+impl<'a, DB> BalDatabase<'a, DB> {
     /// Create a new BAL database.
     #[inline]
     pub fn new(db: DB) -> Self {
@@ -60,7 +60,7 @@ impl<DB> BalDatabase<DB> {
 
     /// With BAL.
     #[inline]
-    pub fn with_bal_option(self, bal: Option<Arc<Bal>>) -> Self {
+    pub fn with_bal_option(self, bal: Option<&'a Bal>) -> Self {
         Self { bal, ..self }
     }
 
@@ -118,7 +118,7 @@ impl<ERROR: Display> Display for BalDatabaseError<ERROR> {
 
 impl<ERROR: Error> Error for BalDatabaseError<ERROR> {}
 
-impl<DB: Database> Database for BalDatabase<DB> {
+impl<'a, DB: Database> Database for BalDatabase<'a, DB> {
     type Error = BalDatabaseError<DB::Error>;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
@@ -191,7 +191,7 @@ impl<DB: Database> Database for BalDatabase<DB> {
     }
 }
 
-impl<DB: DatabaseCommit> DatabaseCommit for BalDatabase<DB> {
+impl<'a, DB: DatabaseCommit> DatabaseCommit for BalDatabase<'a, DB> {
     fn commit(&mut self, changes: EvmState) {
         if let Some(bal_builder) = &mut self.bal_builder {
             for (address, account) in changes.iter() {
