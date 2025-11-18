@@ -83,10 +83,12 @@ pub static KZG_SETTINGS: std::sync::LazyLock<&'static KzgSettings> =
     std::sync::LazyLock::new(|| c_kzg::ethereum_kzg_settings(8));
 
 /// initialize kzg setting at start
-pub fn init_load_kzg_trusted_setup() {
+pub fn init_load_kzg_trusted_setup(debug: bool) {
     let start = Instant::now();
     std::sync::LazyLock::force(&KZG_SETTINGS);
-    println!("kzg load_trusted_setup overhead:{:?}", start.elapsed());
+    if debug {
+        println!("kzg load_trusted_setup overhead:{:?}", start.elapsed());
+    }
 }
 
 /// Verify KZG proof.
@@ -108,6 +110,7 @@ pub fn verify_kzg_proof(
 
             // let kzg_settings = c_kzg::ethereum_kzg_settings(8);
             // kzg_settings.verify_kzg_proof(as_bytes48(commitment), as_bytes32(z), as_bytes32(y), as_bytes48(proof)).unwrap_or(false)
+            // init_load_kzg_trusted_setup(false);
             KZG_SETTINGS.verify_kzg_proof(as_bytes48(commitment), as_bytes32(z), as_bytes32(y), as_bytes48(proof)).unwrap_or(false)
         } else if #[cfg(feature = "blst")] {
             blst::verify_kzg_proof(commitment, z, y, proof)

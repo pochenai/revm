@@ -152,7 +152,7 @@ impl Cmd {
         let prestates = caches_to_prestates(caches, &bals, &blocks, self.pre_tx_state);
 
         // preload kzg trusted setup
-        init_load_kzg_trusted_setup();
+        init_load_kzg_trusted_setup(self.debug);
 
         // set global threads number
         rayon::ThreadPoolBuilder::new()
@@ -182,7 +182,7 @@ impl Cmd {
                     ),
                 }
             } else {
-                execute_blocks(blocks, bals, prestates, block_hashes, self.debug)
+                execute_blocks(blocks, bals, prestates, block_hashes, self)
             }
         );
 
@@ -304,7 +304,7 @@ fn execute_blocks(
     bals: Vec<Bal>,
     caches: Vec<Either<CacheState, Vec<CacheState>>>,
     block_hashes: BTreeMap<u64, B256>,
-    debug: bool,
+    cmd_env: &Cmd,
 ) -> u64 {
     let mut blocks_gas_used = vec![];
     let block_hashes = Arc::new(block_hashes);
@@ -312,6 +312,8 @@ fn execute_blocks(
 
     let mut total_clone_time = Duration::ZERO;
 
+    let debug = cmd_env.debug;
+    let par_7702 = cmd_env.par_7702;
     let mut total_gas_used = 0;
     for (index, (block, (mut bal, cache))) in zip(blocks, zip(bals, caches)).into_iter().enumerate()
     {
@@ -387,7 +389,7 @@ fn execute_blocks(
         let mut results = Vec::with_capacity(body.transactions.len());
 
         for (tx_index, tx) in body.transactions.iter().enumerate() {
-            println!("executing block:{} tx:{}, txhash:{}", bn, tx_index, tx.hash());
+            // println!("executing block:{} tx:{}, txhash:{}", bn, tx_index, tx.hash());
             let (elasped, (block_hashes_clone, bal_ref)) =
                 measure!(false, "clone", { (Arc::clone(&block_hashes), bal_ref) });
             let (prestate, bal) = match &cache {
@@ -403,7 +405,7 @@ fn execute_blocks(
                 tx_index as u64,
                 tx,
                 debug,
-                false,
+                par_7702,
             );
             results.push((tx_index as u64 + 1, changes));
             total_clone_time += elasped;
@@ -1058,7 +1060,10 @@ mod tests {
 
         let prestates = caches_to_prestates(caches, &bals, &blocks, pre_tx_state);
 
-        execute_blocks(blocks, bals, prestates, block_hashes, true);
+        let mut cmd_env = Cmd::default();
+        cmd_env.threads = 5;
+        cmd_env.debug = true;
+        execute_blocks(blocks, bals, prestates, block_hashes, &cmd_env);
     }
 
     #[test]
