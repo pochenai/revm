@@ -115,6 +115,10 @@ pub enum PriorityOrder {
     /// Do not sort by gas limit.
     #[clap(alias = "none")]
     None,
+
+    /// Do not sort by gas limit.
+    #[clap(alias = "bnone")]
+    BigBlocksNone,
 }
 
 enum Scheduler {
@@ -169,7 +173,7 @@ impl Cmd {
             if self.par {
                 let gasused = import_struct(format!("./data/gasused_{nblocks}.json"));
                 match self.schedule_by_gaslimit {
-                    PriorityOrder::None => {
+                    PriorityOrder::BigBlocksNone => {
                         execute_blocks_par(blocks, bals, prestates, block_hashes, gasused, self)
                     }
                     _ => execute_blocks_par_scheduler(
@@ -595,7 +599,7 @@ fn execute_blocks_par_scheduler(
                     indexed_txs.sort_by_key(|(_, _, _, gas_used)| std::cmp::Reverse(*gas_used))
                 );
             }
-            PriorityOrder::None => { /* no sort */ }
+            PriorityOrder::None | PriorityOrder::BigBlocksNone => { /* no sort */ }
         }
 
         unsafe {
@@ -636,16 +640,16 @@ fn execute_blocks_par_scheduler(
                 }
             }
 
-            if max_elapsed > Duration::from_millis(10) {
-                println!(
-                    "Block {} → tx #{} (0-based index), type:{},hash:{}, took the longest: {:?}",
-                    max_block_index,
-                    max_elapsed_idx,
-                    max_elapsed_tx.tx_type(),
-                    max_elapsed_tx.hash(),
-                    max_elapsed
-                );
-            }
+            // if max_elapsed > Duration::from_millis(10) {
+            //     println!(
+            //         "Block {} → tx #{} (0-based index), type:{},hash:{}, took the longest: {:?}",
+            //         max_block_index,
+            //         max_elapsed_idx,
+            //         max_elapsed_tx.tx_type(),
+            //         max_elapsed_tx.hash(),
+            //         max_elapsed
+            //     );
+            // }
 
             sum_longest_tx_time += max_elapsed;
 
@@ -707,6 +711,7 @@ fn execute_blocks_par(
     let mut total_gas_used = 0;
     let batch = cmd_env.batch_blocks;
 
+    let mut sum_longest_tx_time = Duration::ZERO;
     let block_hashes = Arc::new(block_hashes);
     for (_, (blocks, (bals, (caches, txs_gas_used)))) in zip(
         blocks.chunks(batch),
@@ -786,17 +791,25 @@ fn execute_blocks_par(
                 }
             }
 
-            if max_elapsed > Duration::from_millis(10) {
-                println!(
-                    "Block {} → tx #{} (0-based index), type:{},hash:{}, took the longest: {:?}",
-                    max_block_index,
-                    max_elapsed_idx,
-                    max_elapsed_tx.tx_type(),
-                    max_elapsed_tx.hash(),
-                    max_elapsed
-                );
-            }
+            sum_longest_tx_time += max_elapsed;
+            // if max_elapsed > Duration::from_millis(10) {
+            //     println!(
+            //         "Block {} → tx #{} (0-based index), type:{},hash:{}, took the longest: {:?}",
+            //         max_block_index,
+            //         max_elapsed_idx,
+            //         max_elapsed_tx.tx_type(),
+            //         max_elapsed_tx.hash(),
+            //         max_elapsed
+            //     );
+            // }
         }
+    }
+
+    if debug {
+        println!(
+            "Sum of most time-consuming tx durations per block: {:?}",
+            sum_longest_tx_time
+        );
     }
 
     for block in blocks.iter() {
@@ -943,7 +956,7 @@ fn channel_schedule<'a>(
                 res_sender
                     .send((
                         *tx_index as u64 + 1,
-                        bal,
+                        None,
                         elapsed,
                         tx,
                         block_index,
