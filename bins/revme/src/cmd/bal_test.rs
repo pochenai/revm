@@ -30,6 +30,7 @@ use rayon::ThreadPoolBuilder;
 use rayon::{iter::Either, prelude::*};
 
 use clap::{Parser, ValueEnum};
+use std::thread;
 use std::time::Instant;
 
 pub const SYSTEM_ADDRESS: Address = address!("0xfffffffffffffffffffffffffffffffffffffffe");
@@ -97,6 +98,9 @@ pub struct Cmd {
     /// Enable pre-tx state. Default: false (pre-block state + bal), --pre-tx-state: true (pre-tx-state without bal).
     #[arg(long, default_value_t = false)]
     pre_tx_state: bool,
+    /// Skip 7702 txs. Default: false.
+    #[arg(long, default_value_t = false)]
+    skip_7702: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, Default)]
@@ -143,18 +147,45 @@ impl Cmd {
     pub fn run(&self) -> Result<(), super::Error> {
         // Push the file in revme/data directory
         let nblocks = self.nblocks;
-        let recovered_blocks = import_struct(format!("./data/blocks_{nblocks}.json"));
+        println!("loading data......");
+        // let recovered_blocks = import_struct(format!("./data/blocks_{nblocks}.json"));
+        // let bals: Vec<Bal> = import_struct(format!("./data/bals_{nblocks}.json"));
+        // let prestates = import_struct(format!("./data/prestates_{nblocks}.json"));
+        // let block_hashes = import_struct(format!("./data/blockHashes_{nblocks}.json"));
+
+        let blocks_f = thread::spawn({
+            let nblocks = nblocks.clone();
+            move || import_struct(format!("./data/blocks_{nblocks}.json"))
+        });
+
+        let bals_f = thread::spawn({
+            let nblocks = nblocks.clone();
+            move || import_struct(format!("./data/bals_{nblocks}.json"))
+        });
+
+        let prestates_f = thread::spawn({
+            let nblocks = nblocks.clone();
+            move || import_struct(format!("./data/prestates_{nblocks}.json"))
+        });
+
+        let block_hashes_f = thread::spawn({
+            let nblocks = nblocks.clone();
+            move || import_struct(format!("./data/blockHashes_{nblocks}.json"))
+        });
+
+        let recovered_blocks = blocks_f.join().unwrap();
+        let bals: Vec<Bal> = bals_f.join().unwrap();
+        let prestates = prestates_f.join().unwrap();
+        let block_hashes = block_hashes_f.join().unwrap();
+
+        println!("prestates to cache......");
         let blocks: Vec<alloy_consensus::Block<Recovered<EthereumTxEnvelope<TxEip4844>>>> =
             RecoveredBlockVec(recovered_blocks).into();
-
-        let bals: Vec<Bal> = import_struct(format!("./data/bals_{nblocks}.json"));
-        let prestates = import_struct(format!("./data/prestates_{nblocks}.json"));
-        let block_hashes = import_struct(format!("./data/blockHashes_{nblocks}.json"));
-
         let caches = prestates_to_cachedbs(prestates);
 
         let prestates = caches_to_prestates(caches, &bals, &blocks, self.pre_tx_state);
 
+        println!("preloading kzg......");
         // preload kzg trusted setup
         init_load_kzg_trusted_setup(self.debug);
 
@@ -551,8 +582,6 @@ fn execute_blocks_par_scheduler(
         for (block_index, (block, block_txs_gas_used)) in
             zip(blocks, txs_gas_used).into_iter().enumerate()
         {
-            total_gas_used += block.gas_used;
-
             let block_env = BlockEnv {
                 number: U256::from(block.number),
                 beneficiary: block.beneficiary,
@@ -573,6 +602,11 @@ fn execute_blocks_par_scheduler(
             let body = block.clone().into_body();
 
             for (tx_index, tx) in body.transactions.into_iter().enumerate() {
+                total_gas_used += if cmd_env.skip_7702 && tx.is_eip7702() {
+                    0
+                } else {
+                    block_txs_gas_used[tx_index]
+                };
                 indexed_txs.push((tx_index, tx, block_index, block_txs_gas_used[tx_index]));
             }
         }
@@ -750,6 +784,9 @@ fn execute_blocks_par(
                     .par_iter()
                     .enumerate()
                     .map(|(tx_index, tx)| {
+                        if cmd_env.skip_7702 && tx.is_eip7702() {
+                            return (tx_index as u64 + 1, 0, Duration::ZERO, tx, i, 0);
+                        }
                         let (prestate, bal) = match cache {
                             Either::Left(cache) => (cache, Some(bal_ref)),
                             Either::Right(cache) => (&cache[tx_index], None),
@@ -812,8 +849,14 @@ fn execute_blocks_par(
         );
     }
 
-    for block in blocks.iter() {
-        total_gas_used += block.gas_used;
+    for (block, block_txs_gas_used) in zip(blocks, txs_gas_used) {
+        for (tx_index, tx) in block.body.transactions.iter().enumerate() {
+            total_gas_used += if cmd_env.skip_7702 && tx.is_eip7702() {
+                0
+            } else {
+                block_txs_gas_used[tx_index]
+            };
+        }
     }
     total_gas_used
 }
@@ -851,6 +894,19 @@ fn round_robin_schedule<'a>(
                 let mut i = tid;
                 while i < indexed_txs.len() {
                     let (tx_index, tx, block_index, _) = &indexed_txs[i];
+                    if cmd_env.skip_7702 && tx.is_eip7702() {
+                        result.push((
+                            *tx_index as u64 + 1,
+                            None,
+                            Duration::ZERO,
+                            tx,
+                            block_index,
+                            0,
+                        ));
+
+                        i += threads;
+                        continue;
+                    }
                     let (prestate, bal) = match &caches[*block_index] {
                         Either::Left(cache) => (cache, Some(bal_arcs[*block_index])),
                         Either::Right(cache) => (&cache[*tx_index], None),
@@ -934,6 +990,19 @@ fn channel_schedule<'a>(
         (0..threads).into_par_iter().for_each(|_| {
             // let task_receiver = task_receiver.iter().cloned();
             while let Ok((tx_index, tx, block_index, _)) = task_receiver.recv() {
+                if cmd_env.skip_7702 && tx.is_eip7702() {
+                    res_sender
+                        .send((
+                            *tx_index as u64 + 1,
+                            None,
+                            Duration::ZERO,
+                            tx,
+                            block_index,
+                            0,
+                        ))
+                        .expect("Failed to send result");
+                    continue;
+                }
                 let (prestate, bal) = match &caches[*block_index] {
                     Either::Left(cache) => (cache, Some(bal_arcs[*block_index])),
                     Either::Right(cache) => (&cache[*tx_index], None),
