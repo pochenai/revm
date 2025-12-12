@@ -101,6 +101,9 @@ pub struct Cmd {
     /// Skip 7702 txs. Default: false.
     #[arg(long, default_value_t = false)]
     skip_7702: bool,
+    /// Pre recover sender. Default: false.
+    #[arg(long, default_value_t = false)]
+    pre_recover_sender: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, Default)]
@@ -374,7 +377,7 @@ fn execute_blocks(
 
         let body = block.into_body();
 
-        // // TODO: pre-tx bals
+        // // TODO: pre-block bals
         // let parent_hash = block.parent_hash;
         // let parent_beacon_root = block.parent_beacon_block_root.unwrap();
         // let block_env_clone = block_env.clone();
@@ -441,12 +444,13 @@ fn execute_blocks(
                 tx,
                 debug,
                 par_7702,
+                cmd_env.pre_recover_sender,
             );
             results.push((tx_index as u64 + 1, changes));
             total_clone_time += elasped;
         }
 
-        // TODO: add post-tx bals
+        // TODO: add post-block bals
 
         if debug {
             let mut block_gas_used = Vec::with_capacity(results.len());
@@ -495,6 +499,7 @@ fn handle_tx(
     tx: &Recovered<EthereumTxEnvelope<TxEip4844>>,
     debug: bool,
     par_7702: bool,
+    pre_recover_sender: bool,
 ) -> (Option<Bal>, u64) {
     // if debug {
     //     println!(
@@ -519,7 +524,7 @@ fn handle_tx(
         .with_db(&mut state);
 
     let mut evm = evm_context.build_mainnet();
-    let txenv = envelope_to_txenv(tx);
+    let txenv = envelope_to_txenv(tx, pre_recover_sender);
     // println!(
     //     "txid {} sender: {:?}, kind:{:?}",
     //     index, txenv.caller, txenv.tx_type
@@ -804,6 +809,7 @@ fn execute_blocks_par(
                                 tx,
                                 debug,
                                 cmd_env.par_7702,
+                                cmd_env.pre_recover_sender
                             )
                         );
                         // collect bal cause huge memeory allocation thus decrease performance about 8%.
@@ -924,6 +930,7 @@ fn round_robin_schedule<'a>(
                             tx,
                             debug,
                             cmd_env.par_7702,
+                            cmd_env.pre_recover_sender
                         )
                     );
                     result.push((
@@ -1019,6 +1026,7 @@ fn channel_schedule<'a>(
                         tx,
                         debug,
                         cmd_env.par_7702,
+                        cmd_env.pre_recover_sender
                     )
                 );
 

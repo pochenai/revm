@@ -157,7 +157,10 @@ fn prestate_to_cachedb(prestate: PreblockState) -> CacheState {
 }
 
 /// Convert json tx data to revm::TxEnv
-pub fn envelope_to_txenv(envelope: &Recovered<EthereumTxEnvelope<TxEip4844>>) -> TxEnv {
+pub fn envelope_to_txenv(
+    envelope: &Recovered<EthereumTxEnvelope<TxEip4844>>,
+    pre_recover_sender: bool,
+) -> TxEnv {
     // Extract inner transaction
     let blob_hashes = if let Some(h) = envelope.blob_versioned_hashes() {
         h.into()
@@ -172,7 +175,15 @@ pub fn envelope_to_txenv(envelope: &Recovered<EthereumTxEnvelope<TxEip4844>>) ->
 
     TxEnv {
         tx_type: envelope.tx_type() as u8,
-        caller: envelope.signer(),
+        caller: if pre_recover_sender {
+            envelope.signer()
+        } else {
+            envelope
+                .signature()
+                .recover_address_from_prehash(&envelope.signature_hash())
+                .ok()
+                .unwrap()
+        },
         gas_limit: envelope.gas_limit(),
         gas_price: envelope.max_fee_per_gas(), // you can use effective gas price here if needed
         kind: envelope.kind(),
