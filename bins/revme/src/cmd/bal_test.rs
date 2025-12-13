@@ -1099,7 +1099,7 @@ mod tests {
         genesis_state.insert(addr2, acct2);
 
         for (address, account) in genesis_state {
-            state.insert_account_with_storage(address, account, HashMap::new());
+            state.insert_account_with_storage(address, account, HashMap::default());
         }
 
         let block_env = BlockEnv::default();

@@ -20,6 +20,20 @@ pub enum Bytecode {
     LegacyAnalyzed(LegacyAnalyzedBytecode),
 }
 
+impl From<reth_primitives_traits::Bytecode> for Bytecode {
+    fn from(value: reth_primitives_traits::Bytecode) -> Self {
+        let code = value.0.bytecode();
+        Bytecode::new_raw_checked(code.clone()).unwrap()
+    }
+}
+
+impl From<Bytecode> for reth_primitives_traits::Bytecode {
+    fn from(value: Bytecode) -> Self {
+        let code = value.bytecode();
+        reth_primitives_traits::Bytecode::new_raw_checked(code.clone()).unwrap()
+    }
+}
+
 impl Default for Bytecode {
     #[inline]
     fn default() -> Self {

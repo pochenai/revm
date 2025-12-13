@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn test_merge_bal() {
         let mut bal1 = Bal {
-            accounts: IndexMap::new(),
+            accounts: IndexMap::default(),
         };
 
         // Bal #1 with one account
@@ -414,7 +414,7 @@ mod tests {
 
         // Bal #2 with same account, different values
         let mut bal2 = Bal {
-            accounts: IndexMap::new(),
+            accounts: IndexMap::default(),
         };
         bal2.accounts.insert(
             addr1,

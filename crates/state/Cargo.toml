@@ -31,6 +31,9 @@ bitflags.workspace = true
 # Optional
 serde = { workspace = true, features = ["derive", "rc"], optional = true }
 
+# DB
+reth_primitives_traits.workspace = true
+
 [features]
 default = ["std"]
 std = [

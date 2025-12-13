@@ -28,6 +28,28 @@ pub struct AccountInfo {
     pub code: Option<Bytecode>,
 }
 
+impl From<reth_primitives_traits::Account> for AccountInfo {
+    fn from(acct: reth_primitives_traits::Account) -> Self {
+        AccountInfo {
+            balance: acct.balance,
+            nonce: acct.nonce,
+            code_hash: acct.bytecode_hash.unwrap_or_else(|| KECCAK_EMPTY),
+            storage_id: None,
+            code: Some(Bytecode::default()),
+        }
+    }
+}
+
+impl From<AccountInfo> for reth_primitives_traits::Account {
+    fn from(acct: AccountInfo) -> Self {
+        reth_primitives_traits::Account {
+            balance: acct.balance,
+            nonce: acct.nonce,
+            bytecode_hash: Some(acct.code_hash),
+        }
+    }
+}
+
 impl Default for AccountInfo {
     fn default() -> Self {
         Self {

@@ -1,0 +1,50 @@
+[package]
+name = "flatdb"
+version = "0.1.0"
+license.workspace = true
+authors.workspace = true
+categories.workspace = true
+keywords.workspace = true
+repository.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+#  database
+reth_db = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-db", features = [
+    "test-utils",
+    "mdbx",
+] }
+reth_provider = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-provider", features = [
+    "test-utils",
+] }
+reth_chainspec = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-chainspec", features = [
+    "test-utils",
+] }
+reth_primitives_traits.workspace = true
+reth_db_api = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-db-api", features = [
+    "test-utils",
+] }
+reth_ethereum_primitives = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-ethereum-primitives", features = [
+    "test-utils",
+] }
+reth_storage_api = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-storage-api" }
+reth_ethereum_engine_primitives = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-ethereum-engine-primitives" }
+reth_node_types = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-node-types" }
+alloy-primitives = "1.4.1"
+alloy-rlp = "0.3.12"
+
+# workspace
+revm = { workspace = true, features = [
+    "std",
+    "c-kzg",
+    "blst",
+    "tracer",
+    "parse",
+] }
+eyre.workspace = true
+
+[lints]
+workspace = true
