@@ -5356,6 +5356,7 @@ dependencies = [
  "codspeed-criterion-compat",
  "crossbeam",
  "csv",
+ "flatdb",
  "hash-db",
  "indicatif",
  "k256",

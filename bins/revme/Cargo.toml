@@ -46,6 +46,9 @@ csv = "1.1.6"
 rayon.workspace = true
 crossbeam.workspace = true
 
+# db
+flatdb.workspace = true
+
 [features]
 # Optionally enable gmp because it doesn't work on i686 github actions runners
 gmp = ["revm/gmp"]
