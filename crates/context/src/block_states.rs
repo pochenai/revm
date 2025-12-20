@@ -101,7 +101,8 @@ pub struct PreblockState {
 
 /// import blocks from json file
 pub fn import_struct<T: for<'a> Deserialize<'a>, P: AsRef<Path>>(filename: P) -> T {
-    let mut file = File::open(filename).unwrap();
+    let mut file =
+        File::open(&filename).expect(&format!("file:{:?} not found", filename.as_ref().to_str()));
     let mut contents = String::new();
     file.read_to_string(&mut contents).ok().unwrap();
 

@@ -22,7 +22,7 @@ pub enum Bytecode {
 
 impl From<reth_primitives_traits::Bytecode> for Bytecode {
     fn from(value: reth_primitives_traits::Bytecode) -> Self {
-        let code = value.0.bytecode();
+        let code = value.original_bytes();
         Bytecode::new_raw_checked(code.clone()).unwrap()
     }
 }

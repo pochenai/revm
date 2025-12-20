@@ -5,7 +5,7 @@ use core::{
     fmt::Display,
     ops::{Deref, DerefMut},
 };
-use primitives::{Address, StorageKey, StorageValue, B256};
+use primitives::{hex::ToHexExt, Address, StorageKey, StorageValue, B256};
 use state::{
     bal::{Bal, BalError},
     AccountInfo, Bytecode, EvmState,

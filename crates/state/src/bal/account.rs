@@ -54,6 +54,14 @@ impl AccountBal {
         self.storage.merge_storage_bal(other.storage, bal_index);
     }
 
+    /// Merge another bal into the current bal
+    pub fn merge_account_bal_with_offset(&mut self, other: AccountBal, offset: BalIndex) {
+        self.account_info
+            .merge_account_info_bal_with_offset(other.account_info, offset);
+        self.storage
+            .merge_storage_bal_with_offset(other.storage, offset);
+    }
+
     /// Extend account from another account.
     #[inline]
     pub fn update(&mut self, bal_index: BalIndex, account: &Account) {
@@ -186,6 +194,12 @@ impl AccountInfoBal {
         self.code.merge_writes(other.code, bal_index);
     }
 
+    fn merge_account_info_bal_with_offset(&mut self, other: AccountInfoBal, offset: BalIndex) {
+        self.nonce.merge_writes_with_offset(other.nonce, offset);
+        self.balance.merge_writes_with_offset(other.balance, offset);
+        self.code.merge_writes_with_offset(other.code, offset);
+    }
+
     /// Extend account info from another account info.
     #[inline]
     pub fn update(&mut self, index: BalIndex, original: &AccountInfo, present: &AccountInfo) {
@@ -277,6 +291,15 @@ impl StorageBal {
                 .entry(key)
                 .or_insert_with(|| BalWrites { writes: vec![] })
                 .merge_writes(other_writes, bal_index);
+        }
+    }
+
+    fn merge_storage_bal_with_offset(&mut self, other: StorageBal, offset: BalIndex) {
+        for (key, other_writes) in other.storage {
+            self.storage
+                .entry(key)
+                .or_insert_with(|| BalWrites { writes: vec![] })
+                .merge_writes_with_offset(other_writes, offset);
         }
     }
 

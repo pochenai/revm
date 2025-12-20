@@ -130,25 +130,25 @@ impl Bal {
     #[inline]
     /// Extend BAL with account.
     pub fn update_account(&mut self, bal_index: BalIndex, address: Address, account: &Account) {
-        let bal_account = self.accounts.entry(address).or_default();
+        let bal_account: &mut AccountBal = self.accounts.entry(address).or_default();
         bal_account.update(bal_index, account);
     }
 
     /// Merge another Bal into self at the given bal_index.
     pub fn merge_bal(&mut self, other: Bal, bal_index: BalIndex) {
         for (addr, other_account) in other.accounts {
-            let account = self.accounts.entry(addr).or_insert_with(|| AccountBal {
-                account_info: AccountInfoBal {
-                    nonce: BalWrites { writes: vec![] },
-                    balance: BalWrites { writes: vec![] },
-                    code: BalWrites { writes: vec![] },
-                },
-                storage: StorageBal {
-                    storage: BTreeMap::new(),
-                },
-            });
+            let account = self.accounts.entry(addr).or_default();
 
             account.merge_account_bal(other_account, bal_index);
+        }
+    }
+
+    /// Merge another Bal into self start from the given offset.
+    pub fn merge_bal_with_offset(&mut self, other: Bal, offset: BalIndex) {
+        for (addr, other_account) in other.accounts {
+            let account = self.accounts.entry(addr).or_default();
+
+            account.merge_account_bal_with_offset(other_account, offset);
         }
     }
 
@@ -206,6 +206,9 @@ impl Bal {
         account: &mut AccountInfo,
     ) -> Result<bool, BalError> {
         let Some((index, _, bal_account)) = self.accounts.get_full(&address) else {
+            // it's a ugly fix for reads that should be included in bal but actually none.
+            // todo: figure out why 0x0000000000000000000000000000000000000000 in block 23771396 tx index 5 is not inserted in to jounal's state (crates/context/src/journal/inner.rs#726)
+            return Ok(false);
             return Err(BalError::AccountNotFound);
         };
         account.storage_id = Some(index);
@@ -279,6 +282,19 @@ impl Bal {
                 .into_iter()
                 .map(|(address, account)| account.into_alloy_account(address)),
         )
+    }
+
+    ///
+    pub fn max_acct_bal_index(&self) -> BalIndex {
+        let mut max_index = 0;
+        for (addr, bal) in &self.accounts {
+            let info = &bal.account_info;
+            max_index = max_index
+                .max(info.balance.writes.len())
+                .max(info.nonce.writes.len())
+                .max(info.code.writes.len());
+        }
+        max_index as _
     }
 }
 
@@ -454,6 +470,102 @@ mod tests {
         assert_eq!(
             acc.storage.storage[&StorageKey::from(0)].writes.as_slice(),
             vec![(1, StorageValue::from(123)), (2, StorageValue::from(456))].as_slice()
+        );
+    }
+
+    #[test]
+    fn test_merge_bal_with_offset() {
+        let mut bal1 = Bal {
+            accounts: IndexMap::default(),
+        };
+
+        // Bal #1 with one account
+        let addr1 = address!("0x0000000000000000000000000000000000000001");
+        bal1.accounts.insert(
+            addr1,
+            AccountBal {
+                account_info: AccountInfoBal {
+                    nonce: BalWrites {
+                        writes: vec![(1, 10)],
+                    },
+                    balance: BalWrites {
+                        writes: vec![(1, U256::from(100))],
+                    },
+                    code: BalWrites { writes: vec![] },
+                },
+                storage: StorageBal {
+                    storage: BTreeMap::from([(
+                        StorageKey::from(0),
+                        BalWrites {
+                            writes: vec![(1, StorageValue::from(123))],
+                        },
+                    )]),
+                },
+            },
+        );
+
+        // Bal #2 with same account, different values
+        let mut bal2 = Bal {
+            accounts: IndexMap::default(),
+        };
+        let addr2 = address!("0x0000000000000000000000000000000000000002");
+        bal2.accounts.insert(
+            addr1,
+            AccountBal {
+                account_info: AccountInfoBal {
+                    nonce: BalWrites {
+                        writes: vec![(2, 11)],
+                    },
+                    balance: BalWrites {
+                        writes: vec![(2, U256::from(200))],
+                    },
+                    code: BalWrites { writes: vec![] },
+                },
+                storage: StorageBal {
+                    storage: BTreeMap::from([(
+                        StorageKey::from(0),
+                        BalWrites {
+                            writes: vec![(2, StorageValue::from(456))],
+                        },
+                    )]),
+                },
+            },
+        );
+        bal2.accounts.insert(
+            addr2,
+            AccountBal {
+                account_info: AccountInfoBal {
+                    nonce: BalWrites {
+                        writes: vec![(3, 11)],
+                    },
+                    balance: BalWrites { writes: vec![] },
+                    code: BalWrites { writes: vec![] },
+                },
+                storage: StorageBal::default(),
+            },
+        );
+
+        // Merge bal2 into bal1 at bal_index = 2
+        bal1.merge_bal_with_offset(bal2, 10);
+
+        let acc = &bal1.accounts[&addr1];
+        assert_eq!(
+            acc.account_info.nonce.writes.as_slice(),
+            vec![(1, 10), (12, 11)].as_slice()
+        );
+        assert_eq!(
+            acc.account_info.balance.writes.as_slice(),
+            vec![(1, U256::from(100)), (12, U256::from(200))].as_slice()
+        );
+        assert_eq!(
+            acc.storage.storage[&StorageKey::from(0)].writes.as_slice(),
+            vec![(1, StorageValue::from(123)), (12, StorageValue::from(456))].as_slice()
+        );
+
+        let acc = &bal1.accounts[&addr2];
+        assert_eq!(
+            acc.account_info.nonce.writes.as_slice(),
+            vec![(13, 11)].as_slice()
         );
     }
 }

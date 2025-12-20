@@ -45,6 +45,7 @@ revm = { workspace = true, features = [
     "parse",
 ] }
 eyre.workspace = true
+rayon.workspace = true
 
 [lints]
 workspace = true

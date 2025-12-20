@@ -35,3 +35,5 @@ rustc-ice-*
 # profiling
 *.svg
 perf.data*
+# tmp db
+bins/revme/tmp

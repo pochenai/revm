@@ -1,14 +1,18 @@
 //! flatdb
+///
 pub mod node;
+///
+pub mod preblock_db_provider;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{ops::Deref, path::PathBuf, sync::Arc};
 
-use alloy_primitives::{Address, BlockNumber, B256};
+use alloy_primitives::{address, Address, BlockNumber, B256};
 use reth_chainspec::{ChainSpec, MAINNET};
 use reth_db::{init_db, mdbx::DatabaseArguments, tables, test_utils::TempDatabase, DatabaseEnv};
 use reth_db_api::transaction::DbTxMut;
 use reth_primitives_traits::StorageEntry;
-use reth_provider::{
+// re-export
+pub use reth_provider::{
     providers::{ProviderNodeTypes, StaticFileProvider},
     test_utils::MockNodeTypesWithDB,
     ProviderFactory, *,
@@ -27,7 +31,7 @@ use crate::node::EthereumNode;
 ///
 pub trait ProviderRW: DatabaseRef {
     ///
-    fn set_preblock_state(&self, prestate: CacheState);
+    fn set_preblock_state(&self, prestate: &CacheState);
     ///
     fn set_accounts(&self, accts: HashMap<Address, AccountInfo>);
     ///
@@ -42,7 +46,8 @@ pub trait ProviderRW: DatabaseRef {
 
 ///
 pub type MainnetProviderRW = ProviderFactoryWrapper<EthereumNode>;
-
+///
+pub type MockProviderRW = ProviderFactoryWrapper<MockNodeTypesWithDB>;
 ///
 #[derive(Debug)]
 pub struct ProviderFactoryWrapper<N: ProviderNodeTypes> {
@@ -112,22 +117,22 @@ impl ProviderFactoryWrapper<EthereumNode> {
 impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
     /// set preblock state in database before processing each block
     /// It's only used for testing with mock provider.
-    fn set_preblock_state(&self, prestate: CacheState) {
+    fn set_preblock_state(&self, prestate: &CacheState) {
         let provider = self.inner.provider_rw().unwrap();
         let db_tx = provider.tx_ref();
 
-        for (addr, info) in prestate.accounts {
-            if let Some(acct) = info.account {
+        for (addr, info) in &prestate.accounts {
+            if let Some(acct) = &info.account {
                 db_tx
-                    .put::<tables::PlainAccountState>(addr, acct.info.into())
+                    .put::<tables::PlainAccountState>(*addr, (&acct.info).into())
                     .unwrap();
-                for (key, value) in acct.storage {
+                for (key, value) in &acct.storage {
                     db_tx
                         .put::<tables::PlainStorageState>(
-                            addr,
+                            *addr,
                             StorageEntry {
-                                key: key.into(),
-                                value,
+                                key: key.clone().into(),
+                                value: value.clone(),
                             },
                         )
                         .unwrap();
@@ -135,10 +140,10 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
             }
         }
 
-        for (hash, code) in prestate.contracts {
+        for (hash, code) in &prestate.contracts {
             db_tx
                 .put::<tables::Bytecodes>(
-                    hash,
+                    hash.clone(),
                     reth_primitives_traits::Bytecode::new_raw(code.bytes()),
                 )
                 .unwrap();
@@ -205,9 +210,10 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
             let max_bal_index = info_bal
                 .balance
                 .writes
-                .len()
-                .max(info_bal.nonce.writes.len())
-                .max(info_bal.code.writes.len())
+                .last()
+                .map_or(0, |(v, _)| *v)
+                .max(info_bal.nonce.writes.last().map_or(0, |(v, _)| *v))
+                .max(info_bal.code.writes.last().map_or(0, |(v, _)| *v))
                 + 1;
 
             // update changed codes in database
@@ -261,7 +267,7 @@ impl<N: ProviderNodeTypes> DatabaseRef for ProviderFactoryWrapper<N> {
 
     #[doc = " Gets basic account information."]
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        let provider = self.inner.provider().unwrap();
+        let provider = self.inner.latest().unwrap();
         let acct = provider.basic_account(&address);
         match acct {
             Ok(Some(acct)) => Ok(Some(acct.into())),
@@ -306,6 +312,14 @@ impl<N: ProviderNodeTypes> DatabaseRef for ProviderFactoryWrapper<N> {
     }
 }
 
+impl<N: ProviderNodeTypes> Deref for ProviderFactoryWrapper<N> {
+    type Target = ProviderFactory<N>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{address, hex, keccak256, U256};
@@ -341,7 +355,7 @@ mod tests {
         storage.insert(key, value);
 
         // set initial state in db
-        provider.set_preblock_state(prestate);
+        provider.set_preblock_state(&prestate);
         provider.set_codes(codes);
         provider.set_storage(addr, storage);
 
@@ -412,7 +426,7 @@ mod tests {
     #[test]
     fn test_mainnet_data() {
         let provider = ProviderFactoryWrapper::<EthereumNode>::new(
-            "/root/test_nodes/ethereum/execution/reth_full_bak23600000/reth_full".into(),
+            "/root/test_nodes/ethereum/execution/reth_full_bak".into(),
         );
 
         let bn = provider.inner.best_block_number().unwrap();
@@ -422,12 +436,13 @@ mod tests {
             .provider()
             .unwrap()
             .last_finalized_block_number()
+            .unwrap()
             .unwrap();
         println!("last block number:{:?}", bn);
         let provider_rw = provider.inner.provider_rw().unwrap();
 
-        // let prev_bn = 23600000;
-        provider_rw.save_finalized_block_number(23600000).unwrap();
+        // let bn = 23769999;
+        provider_rw.save_finalized_block_number(bn).unwrap();
         provider_rw.commit().unwrap();
         // set some accounts
         let addr = address!("0xdAC17F958D2ee523a2206206994597C13D831ec7");

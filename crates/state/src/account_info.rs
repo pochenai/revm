@@ -50,6 +50,16 @@ impl From<AccountInfo> for reth_primitives_traits::Account {
     }
 }
 
+impl From<&AccountInfo> for reth_primitives_traits::Account {
+    fn from(acct: &AccountInfo) -> Self {
+        reth_primitives_traits::Account {
+            balance: acct.balance,
+            nonce: acct.nonce,
+            bytecode_hash: Some(acct.code_hash),
+        }
+    }
+}
+
 impl Default for AccountInfo {
     fn default() -> Self {
         Self {

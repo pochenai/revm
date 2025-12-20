@@ -20,10 +20,19 @@ impl<T: PartialEq + Clone> BalWrites<T> {
         Self { writes }
     }
 
+    ///
     pub fn merge_writes(&mut self, mut other: BalWrites<T>, bal_index: BalIndex) {
         // Add a new layer of writes tagged with the provided bal_index.
         for (_, val) in other.writes.drain(..) {
             self.writes.push((bal_index, val));
+        }
+    }
+
+    ///
+    pub fn merge_writes_with_offset(&mut self, mut other: BalWrites<T>, offset: BalIndex) {
+        // Add a new layer of writes tagged with the provided bal_index.
+        for (bal_index, val) in other.writes.drain(..) {
+            self.writes.push((bal_index + offset, val));
         }
     }
 
@@ -159,9 +168,19 @@ mod tests {
 
     #[test]
     fn test_get_binary() {
-        let bal_writes =
-            BalWrites::new(vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
+        let bal_writes = BalWrites::new(vec![
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 4),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (6, 8),
+            (6, 9),
+        ]);
         assert_eq!(bal_writes.get(0), None);
         assert_eq!(bal_writes.get(5), Some(5));
+        assert_eq!(bal_writes.get(7), Some(9));
     }
 }

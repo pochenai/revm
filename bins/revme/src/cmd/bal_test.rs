@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     iter::zip,
+    ops::Deref,
     sync::Arc,
     time::Duration,
 };
@@ -8,6 +9,7 @@ use std::{
 use crossbeam::channel::unbounded;
 
 use alloy_primitives::{bytes, Bytes};
+use flatdb::{MainnetProviderRW, MockProviderRW, ProviderFactoryWrapper, ProviderRW};
 use revm::{
     context::{
         block_states::{
@@ -17,11 +19,15 @@ use revm::{
         BlockEnv,
     },
     context_interface::block::{self, BlobExcessGasAndPrice},
-    database::{bal::BalDatabase, states::CacheAccount, CacheState, PlainAccount, State},
+    database::{
+        bal::BalDatabase,
+        states::{cache::MyError, CacheAccount},
+        CacheState, PlainAccount, State,
+    },
     precompile::kzg_point_evaluation::init_load_kzg_trusted_setup,
     primitives::{address, alloy_primitives, hardfork::SpecId, Address, B256, KECCAK_EMPTY, U256},
     state::bal::Bal,
-    Context, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
+    Context, DatabaseRef, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
 };
 
 use alloy_consensus::{transaction::Recovered, Block, EthereumTxEnvelope, Transaction, TxEip4844};
@@ -104,6 +110,10 @@ pub struct Cmd {
     /// Pre recover sender. Default: false.
     #[arg(long, default_value_t = false)]
     pre_recover_sender: bool,
+    #[arg(long)]
+    datadir: Option<String>,
+    #[arg(long, value_enum, default_value = "none")]
+    io: IOPattern,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, Default)]
@@ -126,6 +136,33 @@ pub enum PriorityOrder {
     /// Do not sort by gas limit.
     #[clap(alias = "bnone")]
     BigBlocksNone,
+}
+
+#[derive(Clone, Debug, ValueEnum, Default)]
+pub enum IOPattern {
+    #[default]
+    #[clap(alias = "none")]
+    None,
+    /// Parallel I/O with tx-parallelism.
+    Parallel,
+    /// Batched prefetching I/O given bal read locations.
+    Batched,
+}
+
+enum DBProvider {
+    MockDB(MockProviderRW),
+    MainnetDB(MainnetProviderRW),
+}
+
+impl Deref for DBProvider {
+    type Target = dyn flatdb::ProviderRW<Error = MyError>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            DBProvider::MockDB(db) => db as _,
+            DBProvider::MainnetDB(db) => db as _,
+        }
+    }
 }
 
 enum Scheduler {
@@ -156,25 +193,16 @@ impl Cmd {
         // let prestates = import_struct(format!("./data/prestates_{nblocks}.json"));
         // let block_hashes = import_struct(format!("./data/blockHashes_{nblocks}.json"));
 
-        let blocks_f = thread::spawn({
-            let nblocks = nblocks.clone();
-            move || import_struct(format!("./data/blocks_{nblocks}.json"))
-        });
+        let blocks_f =
+            thread::spawn(move || import_struct(format!("./data/blocks_{nblocks}.json")));
 
-        let bals_f = thread::spawn({
-            let nblocks = nblocks.clone();
-            move || import_struct(format!("./data/bals_{nblocks}.json"))
-        });
+        let bals_f = thread::spawn(move || import_struct(format!("./data/bals_{nblocks}.json")));
 
-        let prestates_f = thread::spawn({
-            let nblocks = nblocks.clone();
-            move || import_struct(format!("./data/prestates_{nblocks}.json"))
-        });
+        let prestates_f =
+            thread::spawn(move || import_struct(format!("./data/prestates_{nblocks}.json")));
 
-        let block_hashes_f = thread::spawn({
-            let nblocks = nblocks.clone();
-            move || import_struct(format!("./data/blockHashes_{nblocks}.json"))
-        });
+        let block_hashes_f =
+            thread::spawn(move || import_struct(format!("./data/blockHashes_{nblocks}.json")));
 
         let recovered_blocks = blocks_f.join().unwrap();
         let bals: Vec<Bal> = bals_f.join().unwrap();
@@ -186,7 +214,31 @@ impl Cmd {
             RecoveredBlockVec(recovered_blocks).into();
         let caches = prestates_to_cachedbs(prestates);
 
+        let database_factory = self.datadir.as_ref().map(|datadir| {
+            // let provider_rw = flatdb::MainnetProviderRW::new(datadir.into());
+            // let db_finalized_bn = provider_rw.last_finalized_block_number().unwrap();
+            // if db_finalized_bn != blocks[0].number - 1 {
+            //     panic!("Database finalized block number {} does not match the first block's parent number {}. Please ensure the database is synced to the correct state.", db_finalized_bn, blocks[0].number - 1);
+            // }
+            // println!("Database {} loaded at finalized block number {}", datadir,db_finalized_bn);
+            // DBProvider::MainnetDB(provider_rw)
+
+            let datadir = "./tmp";
+            let provider_rw = MockProviderRW::new(datadir.into());
+            let all_pre_state = derive_pre_all_execution_state(&caches);
+            provider_rw.set_preblock_state(&all_pre_state);
+            DBProvider::MockDB(provider_rw)
+        });
+
         let prestates = caches_to_prestates(caches, &bals, &blocks, self.pre_tx_state);
+
+        let (gasused, batch_merged_bals) = if self.par {
+            let gasused = import_struct(format!("./data/gasused_{nblocks}.json"));
+            let batch_merged_bals = batch_merged_bal(&bals, &gasused, self);
+            (gasused, batch_merged_bals)
+        } else {
+            (vec![], vec![])
+        };
 
         println!("preloading kzg......");
         // preload kzg trusted setup
@@ -201,37 +253,109 @@ impl Cmd {
 
         println!("start executing......");
         let task_name = format!("threads: {}, blocks: {},", self.threads, bals.len(),);
-        let (elapsed, gas_used) = measure!(
+        let (elapsed, (gas_used, commit_time)) = measure!(
             true,
             task_name,
             if self.par {
-                let gasused = import_struct(format!("./data/gasused_{nblocks}.json"));
+                assert_eq!(gasused.len(), blocks.len());
                 match self.schedule_by_gaslimit {
-                    PriorityOrder::BigBlocksNone => {
-                        execute_blocks_par(blocks, bals, prestates, block_hashes, gasused, self)
-                    }
-                    _ => execute_blocks_par_scheduler(
+                    PriorityOrder::None | PriorityOrder::BigBlocksNone => execute_blocks_par(
                         blocks,
-                        bals,
+                        batch_merged_bals,
                         prestates,
+                        database_factory,
                         block_hashes,
                         gasused,
                         self,
                     ),
+                    _ => (
+                        execute_blocks_par_scheduler(
+                            blocks,
+                            bals,
+                            prestates,
+                            block_hashes,
+                            gasused,
+                            self,
+                        ),
+                        Duration::ZERO,
+                    ),
                 }
             } else {
-                execute_blocks(blocks, bals, prestates, block_hashes, self)
+                (
+                    execute_blocks(blocks, bals, prestates, block_hashes, self),
+                    Duration::ZERO,
+                )
             }
         );
 
         println!(
             "total gas used:{}M, gas per second:{:?} MGas/s",
             gas_used / 1_000_000,
-            gas_used / (elapsed.as_millis() as u64) / 1000
+            gas_used / ((elapsed - commit_time).as_millis() as u64) / 1000
         );
 
         Ok(())
     }
+}
+
+fn batch_merged_bal(bals: &Vec<Bal>, txs_gas_used: &Vec<Vec<u64>>, cmd_env: &Cmd) -> Vec<Bal> {
+    let chunk_size = cmd_env.batch_blocks;
+    let mut res = vec![];
+    zip(bals.chunks(chunk_size), txs_gas_used.chunks(chunk_size)).for_each(
+        |(chunked_bals, chunked_txs)| {
+            let mut offset = 0;
+            let mut bal = Bal::default();
+            for (other, txs) in zip(chunked_bals, chunked_txs) {
+                bal.merge_bal_with_offset(other.clone(), offset);
+                offset += txs.len() as u64 + 2;
+            }
+
+            res.push(bal);
+        },
+    );
+
+    res
+}
+
+/* for mock db, derive accessed state at the start block number.
+ need to filter created account, so when it's first access if it's none don't update; if it doesn't exist just insert none.
+ For account, if key doesn't exist (don't care where value non or not), insert;
+ For storage, is account exist & code_hash !=None
+    if storage key doesm't exist insert
+For code, if codeHash doesn't exist insert.
+ */
+
+fn derive_pre_all_execution_state(caches: &[CacheState]) -> CacheState {
+    let mut pre_all_state: CacheState = CacheState::default();
+    for cache in caches {
+        // insert account and storage on if the addr or storage key is not exist (not value).
+        for (addr, acct) in &cache.accounts {
+            match pre_all_state.accounts.get_mut(addr) {
+                Some(cur) => {
+                    if let Some(cur) = cur.account.as_mut() {
+                        if let Some(next) = &acct.account {
+                            for (slot, val) in &next.storage {
+                                cur.storage.entry(*slot).or_insert(*val);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    pre_all_state.accounts.insert(*addr, acct.clone());
+                }
+            };
+        }
+
+        // insert contracts
+        for (code_hash, code) in &cache.contracts {
+            pre_all_state
+                .contracts
+                .entry(*code_hash)
+                .or_insert(code.clone());
+        }
+    }
+
+    pre_all_state
 }
 
 fn derive_pre_tx_states(pre_block_state: CacheState, bal: &Bal, len_txs: u64) -> Vec<CacheState> {
@@ -346,7 +470,6 @@ fn execute_blocks(
 ) -> u64 {
     let mut blocks_gas_used = vec![];
     let block_hashes = Arc::new(block_hashes);
-    let num_blocks = blocks.len();
 
     let mut total_clone_time = Duration::ZERO;
 
@@ -441,6 +564,7 @@ fn execute_blocks(
                 bal,
                 prestate,
                 tx_index as u64,
+                0,
                 tx,
                 debug,
                 par_7702,
@@ -484,7 +608,7 @@ fn execute_blocks(
     println!("total clone time:{:?}", total_clone_time);
     println!("write block gas used!");
     write_data(
-        format!("gasused_{}.json", num_blocks).as_str(),
+        format!("gasused_{}.json", cmd_env.nblocks).as_str(),
         &blocks_gas_used,
     );
     total_gas_used
@@ -494,8 +618,9 @@ fn handle_tx(
     block_env: &BlockEnv,
     block_hashes: Arc<BTreeMap<u64, B256>>,
     bal_ref: Option<&Bal>,
-    cache: &CacheState,
+    cache: impl DatabaseRef,
     tx_index: u64, // tx index start from 0, while the first tx's bal index is 1
+    offset: u64,
     tx: &Recovered<EthereumTxEnvelope<TxEip4844>>,
     debug: bool,
     par_7702: bool,
@@ -515,7 +640,7 @@ fn handle_tx(
     let mut state = BalDatabase::new(cached_state)
         .with_bal_builder()
         .with_bal_option(bal_ref);
-    state.bal_index = tx_index + 1;
+    state.bal_index = tx_index + offset + 1;
 
     let blocknumber = block_env.number;
     // Create EVM context for each transaction to ensure fresh state access
@@ -533,9 +658,10 @@ fn handle_tx(
     if exe_result.is_err() {
         eprintln!("{:?}", exe_result);
         panic!(
-            "execution error for block: {} tx: {}, hash:{:?}",
+            "execution error for block: {} tx: {}, merged bal_index:{}, hash:{:?}",
             blocknumber,
             tx_index,
+            state.bal_index,
             tx.hash()
         )
     }
@@ -740,28 +866,47 @@ fn execute_blocks_par_scheduler(
 
 fn execute_blocks_par(
     blocks: Vec<RethBlock>,
-    bals: Vec<Bal>,
+    batch_merged_bals: Vec<Bal>,
     prestates: Vec<Either<CacheState, Vec<CacheState>>>,
+    db_rw: Option<DBProvider>,
     block_hashes: BTreeMap<u64, B256>,
     txs_gas_used: Vec<Vec<u64>>,
     cmd_env: &Cmd,
-) -> u64 {
+) -> (u64, Duration) {
     let debug = cmd_env.debug;
     let mut total_gas_used = 0;
     let batch = cmd_env.batch_blocks;
+    let mut current_bn = blocks[0].number - 1;
+    let mut commit_time = Duration::ZERO;
 
     let mut sum_longest_tx_time = Duration::ZERO;
     let block_hashes = Arc::new(block_hashes);
-    for (_, (blocks, (bals, (caches, txs_gas_used)))) in zip(
-        blocks.chunks(batch),
-        zip(
-            bals.chunks(batch),
-            zip(prestates.chunks(batch), txs_gas_used.chunks(batch)),
-        ),
-    )
-    .into_iter()
-    .enumerate()
+    for (chunk_idx, (blocks, batch_merged_bal)) in zip(blocks.chunks(batch), &batch_merged_bals)
+        .into_iter()
+        .enumerate()
     {
+        // for mockDB, set merged pre-block state
+        // if let Some(db) = db_rw.as_ref() {
+        //     match db {
+        //         // todo merge prestates together to only include the prestate if not exist, so this will not write dirty state to pre-block state
+        //         DBProvider::MockDB(db) => {
+        //             let block_idx = chunk_idx * batch;
+        //             let cache = &prestates[block_idx];
+        //             match cache {
+        //                 Either::Left(c) => db.set_preblock_state(c),
+        //                 _ => panic!("only preblock state can be used in mockdb"),
+        //             }
+        //         }
+        //         _ => {}
+        //     }
+        // };
+
+        let mut txs_bal_offsets = Vec::with_capacity(blocks.len());
+        let mut tx_offset: u64 = 0;
+        blocks.iter().for_each(|b| {
+            txs_bal_offsets.push(tx_offset);
+            tx_offset += b.body.transactions.len() as u64 + 2;
+        });
         let chunk_results = blocks
             .par_iter()
             .enumerate()
@@ -780,8 +925,8 @@ fn execute_blocks_par(
                     )),
                 };
 
-                let bal_ref = &bals[i];
-                let cache = &caches[i];
+                let bal_ref = batch_merged_bal;
+                let bal_offset = txs_bal_offsets[i];
 
                 let results = block
                     .body
@@ -790,11 +935,20 @@ fn execute_blocks_par(
                     .enumerate()
                     .map(|(tx_index, tx)| {
                         if cmd_env.skip_7702 && tx.is_eip7702() {
-                            return (tx_index as u64 + 1, 0, Duration::ZERO, tx, i, 0);
+                            return (tx_index as u64, 0, Duration::ZERO, tx, i, 0);
                         }
-                        let (prestate, bal) = match cache {
-                            Either::Left(cache) => (cache, Some(bal_ref)),
-                            Either::Right(cache) => (&cache[tx_index], None),
+                        let (prestate, bal) = match db_rw.as_ref() {
+                            Some(db) => (Either::Left(db.deref()), Some(bal_ref)),
+                            None => {
+                                let block_idx = i + chunk_idx * batch;
+                                let cache = &prestates[block_idx];
+                                match cache {
+                                    Either::Left(cache) => (Either::Right(cache), Some(bal_ref)),
+                                    Either::Right(tx_caches) => {
+                                        (Either::Right(&tx_caches[tx_index]), None)
+                                    }
+                                }
+                            }
                         };
 
                         let (elapsed, (bal, gas_used)) = measure!(
@@ -805,7 +959,8 @@ fn execute_blocks_par(
                                 block_hashes.clone(),
                                 bal,
                                 prestate,
-                                tx_index as u64,
+                                tx_index as _,
+                                bal_offset,
                                 tx,
                                 debug,
                                 cmd_env.par_7702,
@@ -820,15 +975,22 @@ fn execute_blocks_par(
             })
             .collect::<Vec<_>>();
 
+        let commit_start = Instant::now();
+        current_bn += blocks.len() as u64;
+        if let Some(db) = db_rw.as_ref() {
+            db.commit_bal_changes(batch_merged_bal, current_bn);
+        }
+        commit_time += commit_start.elapsed();
+
         if debug {
             let mut max_elapsed = Duration::ZERO;
             let mut max_elapsed_idx = 0;
             let mut max_elapsed_tx = &chunk_results[0].3;
             let mut max_block_index: usize = 0;
-            for (bal_index, _, elapsed, tx, block_index, _gas_used) in &chunk_results {
+            for (bal_index_unmerged, _, elapsed, tx, block_index, _gas_used) in &chunk_results {
                 if elapsed > &max_elapsed {
                     max_elapsed = *elapsed;
-                    max_elapsed_idx = bal_index - 1;
+                    max_elapsed_idx = bal_index_unmerged - 1;
                     max_elapsed_tx = tx;
                     max_block_index = *block_index;
                 }
@@ -864,7 +1026,8 @@ fn execute_blocks_par(
             };
         }
     }
-    total_gas_used
+    println!("execute_blocks_par complete!");
+    (total_gas_used, commit_time)
 }
 
 fn round_robin_schedule<'a>(
@@ -927,6 +1090,7 @@ fn round_robin_schedule<'a>(
                             bal,
                             prestate,
                             *tx_index as u64,
+                            0,
                             tx,
                             debug,
                             cmd_env.par_7702,
@@ -1023,6 +1187,7 @@ fn channel_schedule<'a>(
                         bal,
                         prestate,
                         *tx_index as u64,
+                        0,
                         tx,
                         debug,
                         cmd_env.par_7702,
@@ -1053,6 +1218,7 @@ fn channel_schedule<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::{hex, keccak256};
     use revm::{
         context::{
             block_states::{import_struct, prestates_to_cachedbs},
@@ -1060,11 +1226,139 @@ mod tests {
             BlockEnv, ContextTr, TxEnv,
         },
         database::{bal::BalDatabase, State},
-        primitives::{address, hex::FromHex, Address, HashMap, KECCAK_EMPTY, U256},
+        primitives::{address, hex::FromHex, Address, HashMap, StorageKey, KECCAK_EMPTY, U256},
         state::{bal::Bal, AccountInfo, Bytecode},
         Context, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn test_derive_pre_all_execution_state_works() {
+        // case 1: cache1 a1 is none, cache2 a1 is non-none => cache should be none (cache 1).
+        let mut caches = vec![];
+        let mut c1 = CacheState::default();
+        let a1 = address!("0x0000000000000000000000000000000000000001");
+        c1.accounts.insert(a1, CacheAccount::default());
+        caches.push(c1.clone());
+
+        let mut c1_new = CacheState::default();
+        let mut cache_acct_1 = CacheAccount::default();
+        let mut acct_1 = PlainAccount::default();
+        acct_1.info.nonce = 1;
+        cache_acct_1.account = Some(acct_1);
+        c1_new.accounts.insert(a1, cache_acct_1);
+        caches.push(c1_new);
+
+        let res = derive_pre_all_execution_state(&caches);
+        assert_eq!(res, c1);
+
+        // case 2: cache1 a1 is non-none with nonce 1, cache2 a1 is non-none with nonce 2 => cache should be cache1.
+        let mut caches = vec![];
+        let mut c1 = CacheState::default();
+        let a1 = address!("0x0000000000000000000000000000000000000001");
+        let mut cache_acct_1 = CacheAccount::default();
+        let mut acct_1 = PlainAccount::default();
+        acct_1.info.nonce = 1;
+        cache_acct_1.account = Some(acct_1);
+        c1.accounts.insert(a1, cache_acct_1);
+        caches.push(c1.clone());
+
+        let mut c1_new = CacheState::default();
+        let mut cache_acct_1 = CacheAccount::default();
+        let mut acct_1 = PlainAccount::default();
+        acct_1.info.nonce = 2;
+        cache_acct_1.account = Some(acct_1);
+        c1_new.accounts.insert(a1, cache_acct_1);
+        caches.push(c1_new);
+
+        // case 3: cache1 a1 is non-none with nonce 1, cache2 a2 is non-none with nonce 2 => cache should be cache1 ∪ cache 2.
+        let mut caches = vec![];
+        let mut c1 = CacheState::default();
+        let a1 = address!("0x0000000000000000000000000000000000000001");
+        let mut cache_acct_1 = CacheAccount::default();
+        let mut acct_1 = PlainAccount::default();
+        acct_1.info.nonce = 1;
+        cache_acct_1.account = Some(acct_1);
+        c1.accounts.insert(a1, cache_acct_1.clone());
+        caches.push(c1.clone());
+
+        let mut c2 = CacheState::default();
+        let a2 = address!("0x0000000000000000000000000000000000000002");
+        let mut cache_acct_2 = CacheAccount::default();
+        let mut acct_2 = PlainAccount::default();
+        acct_2.info.nonce = 2;
+        cache_acct_2.account = Some(acct_2);
+        c2.accounts.insert(a2, cache_acct_2.clone());
+        caches.push(c2);
+
+        let res = derive_pre_all_execution_state(&caches);
+        assert_eq!(res.accounts.get(&a1), Some(&cache_acct_1));
+        assert_eq!(res.accounts.get(&a2), Some(&cache_acct_2));
+
+        // case 4: cache1 a1 is non-none with nonce 1, slot:{1:0}, cache2 a1 is non-none with nonce 2, slot{2:1} => cache should be nonce 1, slots: {1:0, 2:1}.
+        let mut caches = vec![];
+        let mut c1 = CacheState::default();
+        let a1 = address!("0x0000000000000000000000000000000000000001");
+        let mut cache_acct_1 = CacheAccount::default();
+        let mut acct_1 = PlainAccount::default();
+        acct_1.info.nonce = 1;
+        acct_1
+            .storage
+            .insert(StorageKey::from(1), StorageKey::from(1));
+        cache_acct_1.account = Some(acct_1);
+        c1.accounts.insert(a1, cache_acct_1.clone());
+        caches.push(c1.clone());
+
+        let mut c1_new = CacheState::default();
+        let mut cache_acct_1 = CacheAccount::default();
+        let mut acct_1 = PlainAccount::default();
+        acct_1.info.nonce = 2;
+        acct_1
+            .storage
+            .insert(StorageKey::from(2), StorageKey::from(1));
+        cache_acct_1.account = Some(acct_1);
+        c1_new.accounts.insert(a1, cache_acct_1.clone());
+        caches.push(c1_new);
+
+        let res = derive_pre_all_execution_state(&caches);
+        let mut expected_cache_acct = CacheAccount::default();
+        let mut expected_acct = PlainAccount::default();
+        expected_acct.info.nonce = 1;
+        expected_acct
+            .storage
+            .insert(StorageKey::from(1), StorageKey::from(1));
+        expected_acct
+            .storage
+            .insert(StorageKey::from(2), StorageKey::from(1));
+        expected_cache_acct.account = Some(expected_acct);
+        assert_eq!(res.accounts.get(&a1), Some(&expected_cache_acct));
+
+        // case 5: cache1 a1 is non-none with code1, cache2 a1 with code2, a2 is code3 => cache should be {a1: code1, c2:code3}.
+        let mut caches = vec![];
+        let mut c1 = CacheState::default();
+        let code1 = hex!("01");
+        let code_hash1 = keccak256(code1);
+        let code1 = Bytecode::new_raw(code1.to_vec().into());
+
+        c1.contracts.insert(code_hash1, code1.clone());
+        caches.push(c1.clone());
+
+        let mut c1 = CacheState::default();
+        let code2 = hex!("02");
+        let code2 = Bytecode::new_raw(code2.to_vec().into());
+
+        let code3 = hex!("03");
+        let code_hash3 = keccak256(code3);
+        let code3 = Bytecode::new_raw(code3.to_vec().into());
+
+        c1.contracts.insert(code_hash1, code2);
+        c1.contracts.insert(code_hash3, code3.clone());
+        caches.push(c1.clone());
+
+        let res = derive_pre_all_execution_state(&caches);
+        assert_eq!(res.contracts.get(&code_hash1), Some(&code1));
+        assert_eq!(res.contracts.get(&code_hash3), Some(&code3));
+    }
 
     #[test]
     fn test_bal() {
