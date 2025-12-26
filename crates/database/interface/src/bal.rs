@@ -8,7 +8,7 @@ use core::{
 use primitives::{hex::ToHexExt, Address, StorageKey, StorageValue, B256};
 use state::{
     bal::{Bal, BalError},
-    AccountInfo, Bytecode, EvmState,
+    AccountInfo, Bytecode, EvmState, RethAccount,
 };
 use std::sync::Arc;
 
@@ -118,11 +118,32 @@ impl<ERROR: Display> Display for BalDatabaseError<ERROR> {
 
 impl<ERROR: Error> Error for BalDatabaseError<ERROR> {}
 
+const DEBUG: bool = false;
+
+macro_rules! dprintln {
+    ($($arg:tt)*) => {
+        if DEBUG {
+            println!($($arg)*);
+        }
+    };
+}
+
 impl<'a, DB: Database> Database for BalDatabase<'a, DB> {
     type Error = BalDatabaseError<DB::Error>;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let mut basic = self.db.basic(address).map_err(BalDatabaseError::Database)?;
+        dprintln!(
+            "db basic, addr:{}, info:{:?}, codelen:{}",
+            address,
+            RethAccount::from(basic.clone().unwrap_or(AccountInfo::default())),
+            basic
+                .as_ref()
+                .unwrap_or(&AccountInfo::default())
+                .code
+                .as_ref()
+                .map_or(0, |c| c.len())
+        );
         if let Some(bal) = &self.bal {
             let is_none = basic.is_none();
             let mut bal_basic = basic.unwrap_or_default();
@@ -143,9 +164,16 @@ impl<'a, DB: Database> Database for BalDatabase<'a, DB> {
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        self.db
+        let code = self
+            .db
             .code_by_hash(code_hash)
-            .map_err(BalDatabaseError::Database)
+            .map_err(BalDatabaseError::Database);
+        dprintln!(
+            "db code, hash:{}, len:{}",
+            code_hash,
+            code.as_ref().unwrap().len()
+        );
+        code
     }
 
     #[doc = " Gets storage value of address at index."]
@@ -154,6 +182,7 @@ impl<'a, DB: Database> Database for BalDatabase<'a, DB> {
             .db
             .storage(address, key)
             .map_err(BalDatabaseError::Database)?;
+        dprintln!("db store, addr:{}, key:{}, value:{:?}", address, key, value);
         if let Some(bal) = &self.bal {
             bal.populate_storage_slot(address, self.bal_index, key, &mut value)
                 .map_err(BalDatabaseError::Bal)?;

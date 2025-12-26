@@ -22,15 +22,17 @@ pub enum Bytecode {
 
 impl From<reth_primitives_traits::Bytecode> for Bytecode {
     fn from(value: reth_primitives_traits::Bytecode) -> Self {
+        // must use original_bytes api or the code will be different
         let code = value.original_bytes();
-        Bytecode::new_raw_checked(code.clone()).unwrap()
+        Bytecode::new_raw_checked(code).unwrap()
     }
 }
 
 impl From<Bytecode> for reth_primitives_traits::Bytecode {
     fn from(value: Bytecode) -> Self {
-        let code = value.bytecode();
-        reth_primitives_traits::Bytecode::new_raw_checked(code.clone()).unwrap()
+        // must use original_bytes api or the code will be different
+        let code = value.original_bytes();
+        reth_primitives_traits::Bytecode::new_raw_checked(code).unwrap()
     }
 }
 

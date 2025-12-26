@@ -4,7 +4,7 @@ use super::{
 };
 use bytecode::Bytecode;
 use database_interface::{Database, DatabaseCommit, DatabaseRef, EmptyDB};
-use primitives::{hash_map, Address, HashMap, StorageKey, StorageValue, B256, BLOCK_HASH_HISTORY};
+use primitives::{hash_map, Address, HashMap, StorageKey, StorageValue, B256};
 use state::{Account, AccountInfo};
 use std::{
     boxed::Box,
@@ -396,7 +396,7 @@ mod tests {
         states::{reverts::AccountInfoRevert, StorageSlot},
         AccountRevert, AccountStatus, BundleAccount, RevertToSlot,
     };
-    use primitives::{keccak256, U256};
+    use primitives::{keccak256, BLOCK_HASH_HISTORY, U256};
 
     #[test]
     fn block_hash_cache() {
@@ -418,7 +418,10 @@ mod tests {
         state.block_hash(test_number).unwrap();
         assert_eq!(
             state.block_hashes,
-            Arc::new(BTreeMap::from([(test_number, block_test_hash), (2, block2_hash)]))
+            Arc::new(BTreeMap::from([
+                (test_number, block_test_hash),
+                (2, block2_hash)
+            ]))
         );
     }
 

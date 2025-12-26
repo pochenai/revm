@@ -11,7 +11,7 @@ mod types;
 
 pub use bytecode;
 
-pub use account_info::AccountInfo;
+pub use account_info::*;
 pub use bytecode::Bytecode;
 pub use primitives;
 pub use types::{EvmState, EvmStorage, TransientStorage};

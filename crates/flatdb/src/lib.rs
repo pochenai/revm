@@ -6,9 +6,13 @@ pub mod preblock_db_provider;
 
 use std::{ops::Deref, path::PathBuf, sync::Arc};
 
-use alloy_primitives::{address, Address, BlockNumber, B256};
+use alloy_primitives::{address, b256, Address, BlockNumber, B256, KECCAK256_EMPTY, U256};
 use reth_chainspec::{ChainSpec, MAINNET};
-use reth_db::{init_db, mdbx::DatabaseArguments, tables, test_utils::TempDatabase, DatabaseEnv};
+use reth_db::{
+    init_db, mdbx::DatabaseArguments, tables, test_utils::TempDatabase, transaction::DbTx,
+    DatabaseEnv,
+};
+use reth_db_api::cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW};
 use reth_db_api::transaction::DbTxMut;
 use reth_primitives_traits::StorageEntry;
 // re-export
@@ -18,6 +22,7 @@ pub use reth_provider::{
     ProviderFactory, *,
 };
 use revm::{
+    context::block_states::PreBlockState,
     database::{states::cache::MyError, CacheState},
     primitives::{HashMap, StorageKey, StorageValue},
     state::{bal::Bal, AccountInfo},
@@ -31,7 +36,7 @@ use crate::node::EthereumNode;
 ///
 pub trait ProviderRW: DatabaseRef {
     ///
-    fn set_preblock_state(&self, prestate: &CacheState);
+    fn set_preblock_state(&self, prestate: &PreBlockState);
     ///
     fn set_accounts(&self, accts: HashMap<Address, AccountInfo>);
     ///
@@ -117,38 +122,36 @@ impl ProviderFactoryWrapper<EthereumNode> {
 impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
     /// set preblock state in database before processing each block
     /// It's only used for testing with mock provider.
-    fn set_preblock_state(&self, prestate: &CacheState) {
+    fn set_preblock_state(&self, prestate: &PreBlockState) {
         let provider = self.inner.provider_rw().unwrap();
-        let db_tx = provider.tx_ref();
+        let db_tx = provider.into_tx();
 
-        for (addr, info) in &prestate.accounts {
-            if let Some(acct) = &info.account {
+        for (addr, all) in &prestate.accounts {
+            if let Some(acct) = &all.info {
                 db_tx
-                    .put::<tables::PlainAccountState>(*addr, (&acct.info).into())
+                    .put::<tables::PlainAccountState>(*addr, acct.into())
                     .unwrap();
-                for (key, value) in &acct.storage {
+                if let Some(code) = &acct.code {
                     db_tx
-                        .put::<tables::PlainStorageState>(
-                            *addr,
-                            StorageEntry {
-                                key: key.clone().into(),
-                                value: value.clone(),
-                            },
-                        )
+                        .put::<tables::Bytecodes>(acct.code_hash, code.clone().into())
                         .unwrap();
                 }
             }
+
+            for (key, value) in &all.storage {
+                db_tx
+                    .put::<tables::PlainStorageState>(
+                        *addr,
+                        StorageEntry {
+                            key: key.clone().into(),
+                            value: value.clone(),
+                        },
+                    )
+                    .unwrap();
+            }
         }
 
-        for (hash, code) in &prestate.contracts {
-            db_tx
-                .put::<tables::Bytecodes>(
-                    hash.clone(),
-                    reth_primitives_traits::Bytecode::new_raw(code.bytes()),
-                )
-                .unwrap();
-        }
-        provider.commit().unwrap();
+        db_tx.commit().unwrap();
     }
 
     /// set account info
@@ -197,16 +200,17 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
     }
 
     fn commit_bal_changes(&self, bal: &Bal, finalized_bn: BlockNumber) {
-        let provider_rw = self.inner.provider_rw().unwrap();
-        let db_tx = provider_rw.tx_ref();
+        let factory = self.inner.provider_rw().unwrap();
+        let provider_ro = self.inner.provider().unwrap();
+        let db_tx = factory.into_tx();
 
         for (addr, acct_bal) in bal.accounts.iter() {
             let info_bal = &acct_bal.account_info;
             let storage_bals = &acct_bal.storage;
 
             // fetch changed account info first
-            let prev_info = provider_rw.basic_account(addr).unwrap().unwrap_or_default();
-            let mut info: AccountInfo = prev_info.into();
+            let prev_info = provider_ro.basic_account(addr).unwrap().unwrap_or_default();
+            let mut info: AccountInfo = prev_info.clone().into();
             let max_bal_index = info_bal
                 .balance
                 .writes
@@ -225,34 +229,50 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
                     .unwrap();
             }
             // update changed account info in database
-            bal.populate_account_info(*addr, max_bal_index as _, &mut info)
-                .unwrap();
+            if max_bal_index > 1 {
+                bal.populate_account_info(*addr, max_bal_index as _, &mut info)
+                    .unwrap();
 
-            db_tx
-                .put::<tables::PlainAccountState>(*addr, info.into())
-                .unwrap();
+                if info.is_empty() {
+                    db_tx
+                        .delete::<tables::PlainAccountState>(*addr, Some(prev_info))
+                        .unwrap();
+                } else {
+                    db_tx
+                        .put::<tables::PlainAccountState>(*addr, info.into())
+                        .unwrap();
+                }
+            }
 
             // update changed storages in database
             for (key, bal_writes) in storage_bals.storage.iter() {
                 if bal_writes.writes.len() > 0 {
-                    db_tx
-                        .put::<tables::PlainStorageState>(
-                            *addr,
-                            StorageEntry {
-                                key: (*key).into(),
-                                value: bal_writes.writes.last().unwrap().1,
-                            },
-                        )
+                    let mut cursor = db_tx
+                        .cursor_dup_write::<tables::PlainStorageState>()
                         .unwrap();
+                    let entry = StorageEntry::new(
+                        (*key).into(),
+                        bal_writes.writes.last().unwrap().1.into(),
+                    );
+                    if let Some(db_entry) = cursor.seek_by_key_subkey(*addr, entry.key).unwrap() {
+                        // must delete existing plainStorage first, becaust put in plainStorage is actually append then sort. If use get, you'll alway get the smallest slot value instead of the recent value.
+                        // ref: https://github.com/paradigmxyz/reth/blob/a672700b4fae17fc3622a93e62e7fefe64ccc78d/crates/storage/provider/src/providers/database/provider.rs#L1786
+                        if db_entry.key == entry.key {
+                            cursor.delete_current().unwrap();
+                        }
+                    }
+
+                    cursor.upsert(*addr, &entry).expect("upsert error");
                 }
             }
         }
 
-        provider_rw
+        db_tx.commit().unwrap();
+        self.inner
+            .provider_rw()
+            .unwrap()
             .save_finalized_block_number(finalized_bn)
             .unwrap();
-
-        provider_rw.commit().unwrap();
     }
 
     fn last_finalized_block_number(&self) -> Option<BlockNumber> {
@@ -270,7 +290,24 @@ impl<N: ProviderNodeTypes> DatabaseRef for ProviderFactoryWrapper<N> {
         let provider = self.inner.latest().unwrap();
         let acct = provider.basic_account(&address);
         match acct {
-            Ok(Some(acct)) => Ok(Some(acct.into())),
+            Ok(Some(acct)) => {
+                // must get code along with basic account.
+                let code_hash = acct.get_bytecode_hash();
+                let code = if code_hash != KECCAK256_EMPTY {
+                    Some(
+                        provider
+                            .bytecode_by_hash(&code_hash)
+                            .unwrap()
+                            .unwrap()
+                            .into(),
+                    )
+                } else {
+                    None
+                };
+                let mut acct_info: AccountInfo = acct.into();
+                acct_info.code = code;
+                Ok(Some(acct_info))
+            }
             Ok(None) => Ok(None),
             Err(_) => panic!("provider basic_ref error,addr:{:?}", address),
         }
@@ -323,7 +360,11 @@ impl<N: ProviderNodeTypes> Deref for ProviderFactoryWrapper<N> {
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{address, hex, keccak256, U256};
-    use revm::{primitives::KECCAK_EMPTY, state::bal::AccountBal};
+    use revm::{
+        context::block_states::MyPlainAccount,
+        primitives::KECCAK_EMPTY,
+        state::bal::{AccountBal, BalWrites},
+    };
 
     use super::*;
     fn provider_with_db_type(mock: bool) {
@@ -336,18 +377,19 @@ mod tests {
         };
 
         // set some accounts
-        let mut prestate = CacheState::default();
+        let mut prestate: PreBlockState = PreBlockState::default();
         let addr = address!("0x1000000000000000000000000000000000000000");
         let mut acct = AccountInfo::default();
         acct.nonce = 1;
         acct.balance = U256::from(0x3635c9adc5dea00000u128);
-        prestate.insert_account(addr, acct.clone());
         // preset some codes
         let code = hex!("5a465a905090036002900360015500");
         let code_hash = keccak256(code);
         let code = Bytecode::new_raw(code.to_vec().into());
-        let mut codes = HashMap::default();
-        codes.insert(code_hash, code.clone());
+        acct.code_hash = code_hash;
+        acct.code = Some(code.clone());
+        prestate.update_accountinfo(addr, acct.clone());
+
         // preset some storages
         let key = StorageKey::ONE;
         let value = StorageValue::ONE * StorageValue::from(4);
@@ -356,7 +398,6 @@ mod tests {
 
         // set initial state in db
         provider.set_preblock_state(&prestate);
-        provider.set_codes(codes);
         provider.set_storage(addr, storage);
 
         // fetch account
@@ -375,10 +416,27 @@ mod tests {
 
     #[test]
     fn test_provider_commit_bal_should_match() {
+        let addr1 = address!("0x0000000000000000000000000000000000000001");
+        let addr2 = address!("0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2");
+
         let p = ProviderFactoryWrapper::<MockNodeTypesWithDB>::new("./temp".into());
 
-        let addr1 = address!("0x0000000000000000000000000000000000000001");
-        let addr2 = address!("0x0000000000000000000000000000000000000002");
+        let slot_key = StorageKey::from_str_radix(
+            "f81d8d79f42adb4c73cc3aa0c78e25d3343882d0313c0b80ece3d3a103ef1ec2",
+            16,
+        )
+        .unwrap();
+        let slot_val =
+            StorageKey::from_str_radix("6912101300000000000000005d48e1115dd60da0", 16).unwrap();
+        let mut c1 = PreBlockState::default();
+        let mut cache_acct_1 = MyPlainAccount::default();
+        cache_acct_1.storage.insert(slot_key, slot_val);
+        c1.accounts.insert(addr2, cache_acct_1.clone());
+        p.set_preblock_state(&c1);
+
+        assert!(matches!(p.storage_ref(addr2, slot_key), Ok(val) if val == slot_val));
+
+        let provider = Some(p);
 
         let mut bal = Bal::default();
         let mut acct_bal = AccountBal::default();
@@ -394,6 +452,12 @@ mod tests {
             .balance
             .writes
             .push((1, U256::from(2000u64)));
+        let slot_val_new =
+            StorageValue::from_str_radix("6912103700000000000000005d48e1115dd60da0", 16).unwrap();
+        acct_bal
+            .storage
+            .storage
+            .insert(slot_key, BalWrites::new(vec![(1, slot_val_new)]));
 
         bal.accounts.insert(addr1, acct_bal.clone());
 
@@ -409,18 +473,22 @@ mod tests {
         bal.accounts.insert(addr2, acct_bal);
 
         // commit bal changes to db
-        p.commit_bal_changes(&bal, 1);
+        if let Some(p) = provider.as_ref() {
+            // let p = provider.as_ref().unwrap();
+            p.commit_bal_changes(&bal, 0);
 
-        // verify changes
-        assert!(
-            matches!(p.basic_ref(addr1), Ok(Some(acct_info)) if acct_info.nonce == 2 && acct_info.balance == U256::from(2000u64) && acct_info.code_hash == KECCAK_EMPTY)
-        );
-        assert!(
-            matches!(p.basic_ref(addr2), Ok(Some(acct_info)) if acct_info.code_hash == code_hash)
-        );
-        assert!(
-            matches!(p.code_by_hash_ref(code_hash), Ok(code_1) if code_1 == code && keccak256(code_1.original_bytes()) == code_hash)
-        );
+            // verify changes
+            assert!(
+                matches!(p.basic_ref(addr1), Ok(Some(acct_info)) if acct_info.nonce == 2 && acct_info.balance == U256::from(2000u64) && acct_info.code_hash == KECCAK_EMPTY)
+            );
+            assert!(
+                matches!(p.basic_ref(addr2), Ok(Some(acct_info)) if acct_info.code_hash == code_hash)
+            );
+            assert!(
+                matches!(p.code_by_hash_ref(code_hash), Ok(code_1) if code_1 == code && keccak256(code_1.original_bytes()) == code_hash)
+            );
+            assert!(matches!(p.storage_ref(addr2, slot_key), Ok(val) if val == slot_val_new));
+        }
     }
 
     #[test]

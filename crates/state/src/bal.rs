@@ -206,9 +206,6 @@ impl Bal {
         account: &mut AccountInfo,
     ) -> Result<bool, BalError> {
         let Some((index, _, bal_account)) = self.accounts.get_full(&address) else {
-            // it's a ugly fix for reads that should be included in bal but actually none.
-            // todo: figure out why 0x0000000000000000000000000000000000000000 in block 23771396 tx index 5 is not inserted in to jounal's state (crates/context/src/journal/inner.rs#726)
-            return Ok(false);
             return Err(BalError::AccountNotFound);
         };
         account.storage_id = Some(index);

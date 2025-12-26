@@ -83,7 +83,7 @@ impl From<RecoveredBlockVec> for Vec<RethBlock> {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 ///
 pub struct MyPlainAccount {
     /// account state and code
@@ -92,11 +92,43 @@ pub struct MyPlainAccount {
     pub storage: PlainStorage,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 ///
-pub struct PreblockState {
+pub struct PreBlockState {
     /// code is in acct info
     pub accounts: HashMap<Address, MyPlainAccount>,
+}
+
+impl PreBlockState {
+    /// insert or update account without storage
+    pub fn update_accountinfo(&mut self, addr: Address, info: AccountInfo) {
+        match self.accounts.entry(addr) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(MyPlainAccount {
+                    info: Some(info),
+                    storage: PlainStorage::default(),
+                });
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                e.get_mut().info = Some(info);
+            }
+        }
+    }
+
+    /// only insert account info and storage slot if it not exits
+    pub fn insert_account(&mut self, addr: Address, other: &MyPlainAccount) {
+        match self.accounts.entry(addr) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(other.clone());
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let s = &mut e.get_mut().storage;
+                for (key, val) in &other.storage {
+                    s.entry(*key).or_insert(*val);
+                }
+            }
+        }
+    }
 }
 
 /// import blocks from json file
@@ -110,7 +142,7 @@ pub fn import_struct<T: for<'a> Deserialize<'a>, P: AsRef<Path>>(filename: P) ->
 }
 
 /// convert prestates to hashdb
-pub fn prestates_to_cachedbs(p: Vec<PreblockState>) -> Vec<CacheState> {
+pub fn prestates_to_cachedbs(p: Vec<PreBlockState>) -> Vec<CacheState> {
     let mut caches = Vec::with_capacity(p.len());
     for prestate in p {
         let cache = prestate_to_cachedb(prestate);
@@ -119,7 +151,7 @@ pub fn prestates_to_cachedbs(p: Vec<PreblockState>) -> Vec<CacheState> {
     caches
 }
 
-fn prestate_to_cachedb(prestate: PreblockState) -> CacheState {
+fn prestate_to_cachedb(prestate: PreBlockState) -> CacheState {
     let mut cache = CacheState::default();
     for (addr, acct) in prestate.accounts {
         let mut code = None;
@@ -225,10 +257,35 @@ pub fn write_data<T: Serialize>(filename: &str, data: &T) {
 mod tests {
     use std::collections::BTreeMap;
 
-    use primitives::address;
+    use primitives::{address, HashMap, StorageKey, StorageValue};
     use state::bal::Bal;
 
     use super::*;
+
+    #[test]
+    fn test_merge_preblock() {
+        let mut p = PreBlockState::default();
+        let mut s1 = HashMap::default();
+        s1.insert(StorageKey::ONE, StorageValue::from(1));
+        let a1 = MyPlainAccount {
+            info: None,
+            storage: s1,
+        };
+
+        let mut s1 = HashMap::default();
+        s1.insert(StorageKey::ONE, StorageValue::from(2));
+        let a2 = MyPlainAccount {
+            info: None,
+            storage: s1,
+        };
+
+        let addr = address!("0xe3aF8532F6D4335dE2c6A0a3aD1cD290E87EE6AE");
+
+        p.insert_account(addr, &a1);
+        p.insert_account(addr, &a2);
+
+        println!("{:?}", p.accounts.get(&addr));
+    }
 
     #[test]
     fn test_import_block() {
@@ -244,7 +301,7 @@ mod tests {
     #[test]
     fn test_import_prestates() {
         let filename = "../../bins/revme/data/prestates_1.json";
-        let prestates: Vec<PreblockState> = import_struct(filename);
+        let prestates: Vec<PreBlockState> = import_struct(filename);
         println!("{:?}", prestates)
     }
 

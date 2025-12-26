@@ -9,12 +9,14 @@ use std::{
 use crossbeam::channel::unbounded;
 
 use alloy_primitives::{bytes, Bytes};
-use flatdb::{MainnetProviderRW, MockProviderRW, ProviderFactoryWrapper, ProviderRW};
+use flatdb::{
+    MainnetProviderRW, MockProviderRW, ProviderFactoryWrapper, ProviderNodeTypes, ProviderRW,
+};
 use revm::{
     context::{
         block_states::{
-            envelope_to_txenv, import_struct, prestates_to_cachedbs, write_data, RecoveredBlockVec,
-            RethBlock,
+            envelope_to_txenv, import_struct, prestates_to_cachedbs, write_data, PreBlockState,
+            RecoveredBlockVec, RethBlock,
         },
         BlockEnv,
     },
@@ -165,6 +167,15 @@ impl Deref for DBProvider {
     }
 }
 
+impl DBProvider {
+    pub fn as_rw(&mut self) -> &mut dyn flatdb::ProviderRW<Error = MyError> {
+        match self {
+            DBProvider::MockDB(db) => db,
+            DBProvider::MainnetDB(db) => db,
+        }
+    }
+}
+
 enum Scheduler {
     RoundRobin,
     ConsumerProducer,
@@ -206,15 +217,14 @@ impl Cmd {
 
         let recovered_blocks = blocks_f.join().unwrap();
         let bals: Vec<Bal> = bals_f.join().unwrap();
-        let prestates = prestates_f.join().unwrap();
+        let prestates: Vec<PreBlockState> = prestates_f.join().unwrap();
         let block_hashes = block_hashes_f.join().unwrap();
 
         println!("prestates to cache......");
         let blocks: Vec<alloy_consensus::Block<Recovered<EthereumTxEnvelope<TxEip4844>>>> =
             RecoveredBlockVec(recovered_blocks).into();
-        let caches = prestates_to_cachedbs(prestates);
 
-        let database_factory = self.datadir.as_ref().map(|datadir| {
+        let database_provider = self.datadir.as_ref().map(|datadir| {
             // let provider_rw = flatdb::MainnetProviderRW::new(datadir.into());
             // let db_finalized_bn = provider_rw.last_finalized_block_number().unwrap();
             // if db_finalized_bn != blocks[0].number - 1 {
@@ -223,12 +233,13 @@ impl Cmd {
             // println!("Database {} loaded at finalized block number {}", datadir,db_finalized_bn);
             // DBProvider::MainnetDB(provider_rw)
 
-            let datadir = "./tmp";
             let provider_rw = MockProviderRW::new(datadir.into());
-            let all_pre_state = derive_pre_all_execution_state(&caches);
+            let all_pre_state = derive_pre_all_execution_state(&prestates);
             provider_rw.set_preblock_state(&all_pre_state);
-            DBProvider::MockDB(provider_rw)
+            provider_rw
         });
+
+        let caches = prestates_to_cachedbs(prestates);
 
         let prestates = caches_to_prestates(caches, &bals, &blocks, self.pre_tx_state);
 
@@ -242,7 +253,7 @@ impl Cmd {
 
         println!("preloading kzg......");
         // preload kzg trusted setup
-        init_load_kzg_trusted_setup(self.debug);
+        init_load_kzg_trusted_setup(false);
 
         // set global threads number
         rayon::ThreadPoolBuilder::new()
@@ -263,7 +274,7 @@ impl Cmd {
                         blocks,
                         batch_merged_bals,
                         prestates,
-                        database_factory,
+                        database_provider,
                         block_hashes,
                         gasused,
                         self,
@@ -324,34 +335,12 @@ fn batch_merged_bal(bals: &Vec<Bal>, txs_gas_used: &Vec<Vec<u64>>, cmd_env: &Cmd
     if storage key doesm't exist insert
 For code, if codeHash doesn't exist insert.
  */
-
-fn derive_pre_all_execution_state(caches: &[CacheState]) -> CacheState {
-    let mut pre_all_state: CacheState = CacheState::default();
+fn derive_pre_all_execution_state(caches: &[PreBlockState]) -> PreBlockState {
+    let mut pre_all_state = PreBlockState::default();
     for cache in caches {
         // insert account and storage on if the addr or storage key is not exist (not value).
         for (addr, acct) in &cache.accounts {
-            match pre_all_state.accounts.get_mut(addr) {
-                Some(cur) => {
-                    if let Some(cur) = cur.account.as_mut() {
-                        if let Some(next) = &acct.account {
-                            for (slot, val) in &next.storage {
-                                cur.storage.entry(*slot).or_insert(*val);
-                            }
-                        }
-                    }
-                }
-                None => {
-                    pre_all_state.accounts.insert(*addr, acct.clone());
-                }
-            };
-        }
-
-        // insert contracts
-        for (code_hash, code) in &cache.contracts {
-            pre_all_state
-                .contracts
-                .entry(*code_hash)
-                .or_insert(code.clone());
+            pre_all_state.insert_account(*addr, acct);
         }
     }
 
@@ -626,13 +615,13 @@ fn handle_tx(
     par_7702: bool,
     pre_recover_sender: bool,
 ) -> (Option<Bal>, u64) {
-    // if debug {
-    //     println!(
-    //         "txindex:{:>3}, gaslimit:{:>8} start",
-    //         tx_index,
-    //         tx.gas_limit()
-    //     );
-    // }
+    // println!(
+    //     "=====block:{}, txidx:{}, txhash:{}=====",
+    //     block_env.number,
+    //     tx_index,
+    //     tx.hash()
+    // );
+
     let cached_state = State::builder()
         .with_block_hashes(block_hashes)
         .with_database_ref(cache)
@@ -670,6 +659,10 @@ fn handle_tx(
     let gas_used = exe_result.result.gas_used();
     let result_state = exe_result.state;
     evm.commit(result_state);
+    // println!(
+    //     "bn:{}, txindex:{}, bal_index:{}, gasused:{}",
+    //     blocknumber, tx_index, state.bal_index, gas_used
+    // );
     (state.bal_builder, gas_used)
     // print!("exe_result:{:?}", exe_result)
 }
@@ -864,50 +857,36 @@ fn execute_blocks_par_scheduler(
     total_gas_used
 }
 
-fn execute_blocks_par(
+fn execute_blocks_par<P: ProviderNodeTypes>(
     blocks: Vec<RethBlock>,
     batch_merged_bals: Vec<Bal>,
     prestates: Vec<Either<CacheState, Vec<CacheState>>>,
-    db_rw: Option<DBProvider>,
+    db_rw: Option<ProviderFactoryWrapper<P>>,
     block_hashes: BTreeMap<u64, B256>,
     txs_gas_used: Vec<Vec<u64>>,
     cmd_env: &Cmd,
 ) -> (u64, Duration) {
     let debug = cmd_env.debug;
+    let start_block = blocks[0].number;
     let mut total_gas_used = 0;
     let batch = cmd_env.batch_blocks;
-    let mut current_bn = blocks[0].number - 1;
+    let mut current_bn = blocks[0].number;
     let mut commit_time = Duration::ZERO;
 
     let mut sum_longest_tx_time = Duration::ZERO;
     let block_hashes = Arc::new(block_hashes);
-    for (chunk_idx, (blocks, batch_merged_bal)) in zip(blocks.chunks(batch), &batch_merged_bals)
-        .into_iter()
-        .enumerate()
+    for (chunk_idx, (chunk_blocks, batch_merged_bal)) in
+        zip(blocks.chunks(batch), &batch_merged_bals)
+            .into_iter()
+            .enumerate()
     {
-        // for mockDB, set merged pre-block state
-        // if let Some(db) = db_rw.as_ref() {
-        //     match db {
-        //         // todo merge prestates together to only include the prestate if not exist, so this will not write dirty state to pre-block state
-        //         DBProvider::MockDB(db) => {
-        //             let block_idx = chunk_idx * batch;
-        //             let cache = &prestates[block_idx];
-        //             match cache {
-        //                 Either::Left(c) => db.set_preblock_state(c),
-        //                 _ => panic!("only preblock state can be used in mockdb"),
-        //             }
-        //         }
-        //         _ => {}
-        //     }
-        // };
-
-        let mut txs_bal_offsets = Vec::with_capacity(blocks.len());
+        let mut txs_bal_offsets = Vec::with_capacity(chunk_blocks.len());
         let mut tx_offset: u64 = 0;
-        blocks.iter().for_each(|b| {
+        chunk_blocks.iter().for_each(|b| {
             txs_bal_offsets.push(tx_offset);
             tx_offset += b.body.transactions.len() as u64 + 2;
         });
-        let chunk_results = blocks
+        let chunk_results = chunk_blocks
             .par_iter()
             .enumerate()
             .flat_map(|(i, block)| {
@@ -938,7 +917,7 @@ fn execute_blocks_par(
                             return (tx_index as u64, 0, Duration::ZERO, tx, i, 0);
                         }
                         let (prestate, bal) = match db_rw.as_ref() {
-                            Some(db) => (Either::Left(db.deref()), Some(bal_ref)),
+                            Some(db) => (Either::Left(db), Some(bal_ref)),
                             None => {
                                 let block_idx = i + chunk_idx * batch;
                                 let cache = &prestates[block_idx];
@@ -975,8 +954,13 @@ fn execute_blocks_par(
             })
             .collect::<Vec<_>>();
 
+        println!(
+            "commit block=====:{}-{}",
+            start_block + (chunk_idx * batch) as u64,
+            start_block + ((chunk_idx + 1) * batch) as u64
+        );
         let commit_start = Instant::now();
-        current_bn += blocks.len() as u64;
+        current_bn += chunk_blocks.len() as u64;
         if let Some(db) = db_rw.as_ref() {
             db.commit_bal_changes(batch_merged_bal, current_bn);
         }
@@ -1026,6 +1010,8 @@ fn execute_blocks_par(
             };
         }
     }
+
+    println!("total commit time:{:?}", commit_time);
     println!("execute_blocks_par complete!");
     (total_gas_used, commit_time)
 }
@@ -1221,7 +1207,7 @@ mod tests {
     use alloy_primitives::{hex, keccak256};
     use revm::{
         context::{
-            block_states::{import_struct, prestates_to_cachedbs},
+            block_states::{import_struct, prestates_to_cachedbs, MyPlainAccount},
             transaction::AccessList,
             BlockEnv, ContextTr, TxEnv,
         },
@@ -1236,16 +1222,16 @@ mod tests {
     fn test_derive_pre_all_execution_state_works() {
         // case 1: cache1 a1 is none, cache2 a1 is non-none => cache should be none (cache 1).
         let mut caches = vec![];
-        let mut c1 = CacheState::default();
+        let mut c1 = PreBlockState::default();
         let a1 = address!("0x0000000000000000000000000000000000000001");
-        c1.accounts.insert(a1, CacheAccount::default());
+        c1.insert_account(a1, &MyPlainAccount::default());
         caches.push(c1.clone());
 
-        let mut c1_new = CacheState::default();
-        let mut cache_acct_1 = CacheAccount::default();
-        let mut acct_1 = PlainAccount::default();
-        acct_1.info.nonce = 1;
-        cache_acct_1.account = Some(acct_1);
+        let mut c1_new = PreBlockState::default();
+        let mut cache_acct_1 = MyPlainAccount::default();
+        let mut acct_1 = AccountInfo::default();
+        acct_1.nonce = 1;
+        cache_acct_1.info = Some(acct_1);
         c1_new.accounts.insert(a1, cache_acct_1);
         caches.push(c1_new);
 
@@ -1254,40 +1240,43 @@ mod tests {
 
         // case 2: cache1 a1 is non-none with nonce 1, cache2 a1 is non-none with nonce 2 => cache should be cache1.
         let mut caches = vec![];
-        let mut c1 = CacheState::default();
+        let mut c1 = PreBlockState::default();
         let a1 = address!("0x0000000000000000000000000000000000000001");
-        let mut cache_acct_1 = CacheAccount::default();
-        let mut acct_1 = PlainAccount::default();
-        acct_1.info.nonce = 1;
-        cache_acct_1.account = Some(acct_1);
+        let mut cache_acct_1 = MyPlainAccount::default();
+        let mut acct_1 = AccountInfo::default();
+        acct_1.nonce = 1;
+        cache_acct_1.info = Some(acct_1);
         c1.accounts.insert(a1, cache_acct_1);
         caches.push(c1.clone());
 
-        let mut c1_new = CacheState::default();
-        let mut cache_acct_1 = CacheAccount::default();
-        let mut acct_1 = PlainAccount::default();
-        acct_1.info.nonce = 2;
-        cache_acct_1.account = Some(acct_1);
+        let mut c1_new = PreBlockState::default();
+        let mut cache_acct_1 = MyPlainAccount::default();
+        let mut acct_1 = AccountInfo::default();
+        acct_1.nonce = 2;
+        cache_acct_1.info = Some(acct_1);
         c1_new.accounts.insert(a1, cache_acct_1);
         caches.push(c1_new);
 
+        let res = derive_pre_all_execution_state(&caches);
+        assert_eq!(res, c1);
+
         // case 3: cache1 a1 is non-none with nonce 1, cache2 a2 is non-none with nonce 2 => cache should be cache1 ∪ cache 2.
         let mut caches = vec![];
-        let mut c1 = CacheState::default();
+        let mut c1 = PreBlockState::default();
         let a1 = address!("0x0000000000000000000000000000000000000001");
-        let mut cache_acct_1 = CacheAccount::default();
-        let mut acct_1 = PlainAccount::default();
-        acct_1.info.nonce = 1;
-        cache_acct_1.account = Some(acct_1);
+        let mut cache_acct_1 = MyPlainAccount::default();
+        let mut acct_1 = AccountInfo::default();
+        acct_1.nonce = 1;
+        cache_acct_1.info = Some(acct_1);
         c1.accounts.insert(a1, cache_acct_1.clone());
         caches.push(c1.clone());
 
-        let mut c2 = CacheState::default();
+        let mut c2 = PreBlockState::default();
         let a2 = address!("0x0000000000000000000000000000000000000002");
-        let mut cache_acct_2 = CacheAccount::default();
-        let mut acct_2 = PlainAccount::default();
-        acct_2.info.nonce = 2;
-        cache_acct_2.account = Some(acct_2);
+        let mut cache_acct_2 = MyPlainAccount::default();
+        let mut acct_2 = AccountInfo::default();
+        acct_2.nonce = 2;
+        cache_acct_2.info = Some(acct_2);
         c2.accounts.insert(a2, cache_acct_2.clone());
         caches.push(c2);
 
@@ -1297,67 +1286,83 @@ mod tests {
 
         // case 4: cache1 a1 is non-none with nonce 1, slot:{1:0}, cache2 a1 is non-none with nonce 2, slot{2:1} => cache should be nonce 1, slots: {1:0, 2:1}.
         let mut caches = vec![];
-        let mut c1 = CacheState::default();
+        let mut c1 = PreBlockState::default();
         let a1 = address!("0x0000000000000000000000000000000000000001");
-        let mut cache_acct_1 = CacheAccount::default();
-        let mut acct_1 = PlainAccount::default();
-        acct_1.info.nonce = 1;
-        acct_1
+        let mut cache_acct_1 = MyPlainAccount::default();
+        let mut acct_1 = AccountInfo::default();
+        acct_1.nonce = 1;
+        cache_acct_1
             .storage
             .insert(StorageKey::from(1), StorageKey::from(1));
-        cache_acct_1.account = Some(acct_1);
+        cache_acct_1.info = Some(acct_1);
         c1.accounts.insert(a1, cache_acct_1.clone());
         caches.push(c1.clone());
 
-        let mut c1_new = CacheState::default();
-        let mut cache_acct_1 = CacheAccount::default();
-        let mut acct_1 = PlainAccount::default();
-        acct_1.info.nonce = 2;
-        acct_1
+        let mut c1_new = PreBlockState::default();
+        let mut cache_acct_1 = MyPlainAccount::default();
+        let mut acct_1 = AccountInfo::default();
+        acct_1.nonce = 2;
+        cache_acct_1
             .storage
             .insert(StorageKey::from(2), StorageKey::from(1));
-        cache_acct_1.account = Some(acct_1);
+        cache_acct_1.info = Some(acct_1);
         c1_new.accounts.insert(a1, cache_acct_1.clone());
         caches.push(c1_new);
 
         let res = derive_pre_all_execution_state(&caches);
-        let mut expected_cache_acct = CacheAccount::default();
-        let mut expected_acct = PlainAccount::default();
-        expected_acct.info.nonce = 1;
-        expected_acct
+        let mut expected_cache_acct = MyPlainAccount::default();
+        let mut expected_acct = AccountInfo::default();
+        expected_acct.nonce = 1;
+        expected_cache_acct
             .storage
             .insert(StorageKey::from(1), StorageKey::from(1));
-        expected_acct
+        expected_cache_acct
             .storage
             .insert(StorageKey::from(2), StorageKey::from(1));
-        expected_cache_acct.account = Some(expected_acct);
+        expected_cache_acct.info = Some(expected_acct);
         assert_eq!(res.accounts.get(&a1), Some(&expected_cache_acct));
 
         // case 5: cache1 a1 is non-none with code1, cache2 a1 with code2, a2 is code3 => cache should be {a1: code1, c2:code3}.
         let mut caches = vec![];
-        let mut c1 = CacheState::default();
+        let mut c1 = PreBlockState::default();
+        let mut cache_acct_1 = MyPlainAccount::default();
         let code1 = hex!("01");
         let code_hash1 = keccak256(code1);
         let code1 = Bytecode::new_raw(code1.to_vec().into());
-
-        c1.contracts.insert(code_hash1, code1.clone());
+        let mut info = AccountInfo::default();
+        info.code = Some(code1.clone());
+        info.code_hash = code_hash1;
+        cache_acct_1.info = Some(info);
+        c1.accounts.insert(a1, cache_acct_1.clone());
         caches.push(c1.clone());
 
-        let mut c1 = CacheState::default();
+        let mut c1 = PreBlockState::default();
+        let mut cache_acct_2 = MyPlainAccount::default();
         let code2 = hex!("02");
+        let code_hash2 = keccak256(code2);
         let code2 = Bytecode::new_raw(code2.to_vec().into());
+        let mut info = AccountInfo::default();
+        info.code = Some(code2.clone());
+        info.code_hash = code_hash2;
+        cache_acct_2.info = Some(info);
+        c1.accounts.insert(a1, cache_acct_2.clone());
+        caches.push(c1.clone());
 
+        let mut c1 = PreBlockState::default();
+        let mut cache_acct_3 = MyPlainAccount::default();
         let code3 = hex!("03");
         let code_hash3 = keccak256(code3);
         let code3 = Bytecode::new_raw(code3.to_vec().into());
-
-        c1.contracts.insert(code_hash1, code2);
-        c1.contracts.insert(code_hash3, code3.clone());
+        let mut info = AccountInfo::default();
+        info.code = Some(code3.clone());
+        info.code_hash = code_hash3;
+        cache_acct_3.info = Some(info);
+        c1.accounts.insert(a2, cache_acct_3.clone());
         caches.push(c1.clone());
 
         let res = derive_pre_all_execution_state(&caches);
-        assert_eq!(res.contracts.get(&code_hash1), Some(&code1));
-        assert_eq!(res.contracts.get(&code_hash3), Some(&code3));
+        assert_eq!(res.accounts.get(&a1), Some(&cache_acct_1));
+        assert_eq!(res.accounts.get(&a2), Some(&cache_acct_3));
     }
 
     #[test]

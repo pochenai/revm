@@ -28,6 +28,7 @@ pub struct AccountInfo {
     pub code: Option<Bytecode>,
 }
 
+pub use reth_primitives_traits::Account as RethAccount;
 impl From<reth_primitives_traits::Account> for AccountInfo {
     fn from(acct: reth_primitives_traits::Account) -> Self {
         AccountInfo {
