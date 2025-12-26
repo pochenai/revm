@@ -117,6 +117,7 @@ derive-where = { version = "1.6.0", default-features = false }
 rand = "0.9"
 tokio = "1.47"
 either = { version = "1.15.0", default-features = false }
+dashmap = { version = "6.1" }
 
 # rayon
 rayon = "1.11"

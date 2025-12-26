@@ -2257,6 +2257,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
+ "dashmap",
  "eyre",
  "rayon",
  "reth-chainspec",
@@ -5069,6 +5070,7 @@ dependencies = [
  "alloy-eips",
  "alloy-provider",
  "alloy-transport",
+ "dashmap",
  "reth-primitives-traits",
  "revm-bytecode 7.0.2",
  "revm-database-interface 8.0.3",

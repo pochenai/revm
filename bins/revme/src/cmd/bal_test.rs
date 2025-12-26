@@ -10,7 +10,8 @@ use crossbeam::channel::unbounded;
 
 use alloy_primitives::{bytes, Bytes};
 use flatdb::{
-    MainnetProviderRW, MockProviderRW, ProviderFactoryWrapper, ProviderNodeTypes, ProviderRW,
+    mtcache::MTCache, MainnetProviderRW, MockProviderRW, ProviderFactoryWrapper, ProviderNodeTypes,
+    ProviderRW,
 };
 use revm::{
     context::{
@@ -157,7 +158,7 @@ enum DBProvider {
 }
 
 impl Deref for DBProvider {
-    type Target = dyn flatdb::ProviderRW<Error = MyError>;
+    type Target = dyn flatdb::ProviderRW;
 
     fn deref(&self) -> &Self::Target {
         match self {
@@ -168,7 +169,7 @@ impl Deref for DBProvider {
 }
 
 impl DBProvider {
-    pub fn as_rw(&mut self) -> &mut dyn flatdb::ProviderRW<Error = MyError> {
+    pub fn as_rw(&mut self) -> &mut dyn flatdb::ProviderRW {
         match self {
             DBProvider::MockDB(db) => db,
             DBProvider::MainnetDB(db) => db,
@@ -886,6 +887,10 @@ fn execute_blocks_par<P: ProviderNodeTypes>(
             txs_bal_offsets.push(tx_offset);
             tx_offset += b.body.transactions.len() as u64 + 2;
         });
+
+        let cached_db = db_rw
+            .as_ref()
+            .and_then(|db| Some(MTCache::new(db.lastest_provider_ro())));
         let chunk_results = chunk_blocks
             .par_iter()
             .enumerate()
@@ -916,7 +921,7 @@ fn execute_blocks_par<P: ProviderNodeTypes>(
                         if cmd_env.skip_7702 && tx.is_eip7702() {
                             return (tx_index as u64, 0, Duration::ZERO, tx, i, 0);
                         }
-                        let (prestate, bal) = match db_rw.as_ref() {
+                        let (prestate, bal) = match cached_db.as_ref() {
                             Some(db) => (Either::Left(db), Some(bal_ref)),
                             None => {
                                 let block_idx = i + chunk_idx * batch;

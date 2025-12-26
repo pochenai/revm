@@ -37,6 +37,7 @@ alloy-transport = { workspace = true, optional = true }
 
 # database
 reth_primitives_traits.workspace = true
+dashmap.workspace = true
 
 [dev-dependencies]
 serde_json = { workspace = true, features = ["alloc"] }

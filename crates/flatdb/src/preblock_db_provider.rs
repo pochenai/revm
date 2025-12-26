@@ -29,7 +29,6 @@ impl PreBlockStateCache {
             contracts: HashMap::new(),
         }
     }
-    
 
     // TODO: reset rayon threads number
     pub fn batch_preblock_state(&mut self, bal: &Bal) {
@@ -38,7 +37,7 @@ impl PreBlockStateCache {
             .iter()
             .map(|(k, _)| *k)
             .collect::<Vec<Address>>();
-        let provider_ro = self.db.latest().unwrap();
+        let provider_ro = self.db.inner.latest().unwrap();
         let accounts = addrs
             .par_iter()
             .map(|address| {

@@ -1,5 +1,7 @@
 //! flatdb
 ///
+pub mod mtcache;
+///
 pub mod node;
 ///
 pub mod preblock_db_provider;
@@ -34,7 +36,7 @@ use revm::bytecode::Bytecode;
 use crate::node::EthereumNode;
 
 ///
-pub trait ProviderRW: DatabaseRef {
+pub trait ProviderRW {
     ///
     fn set_preblock_state(&self, prestate: &PreBlockState);
     ///
@@ -47,6 +49,8 @@ pub trait ProviderRW: DatabaseRef {
     fn commit_bal_changes(&self, bal: &Bal, finalized_bn: BlockNumber);
     ///
     fn last_finalized_block_number(&self) -> Option<BlockNumber>;
+    ///
+    fn lastest_provider_ro(&self) -> LatestProvider;
 }
 
 ///
@@ -279,15 +283,24 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
         let provider = self.inner.provider().unwrap();
         provider.last_finalized_block_number().ok().flatten()
     }
+
+    /// create a lastest provider for a batched blocks.
+    fn lastest_provider_ro(&self) -> LatestProvider {
+        LatestProvider(self.inner.latest().unwrap())
+    }
 }
 
-impl<N: ProviderNodeTypes> DatabaseRef for ProviderFactoryWrapper<N> {
+/// Wrapper for latest provider to minize Box allocation for each underlying latest provider.
+/// If without this, the performance will downgrade ~50%!.
+pub struct LatestProvider(Box<dyn StateProvider>);
+
+impl DatabaseRef for LatestProvider {
     #[doc = " The database error type."]
     type Error = MyError;
 
     #[doc = " Gets basic account information."]
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        let provider = self.inner.latest().unwrap();
+        let provider = &self.0;
         let acct = provider.basic_account(&address);
         match acct {
             Ok(Some(acct)) => {
@@ -315,7 +328,7 @@ impl<N: ProviderNodeTypes> DatabaseRef for ProviderFactoryWrapper<N> {
 
     #[doc = " Gets account code by its hash."]
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        let provider = self.inner.latest().unwrap();
+        let provider = &self.0;
         let code = provider.bytecode_by_hash(&code_hash);
         match code {
             Ok(Some(code)) => Ok(code.into()),
@@ -332,7 +345,7 @@ impl<N: ProviderNodeTypes> DatabaseRef for ProviderFactoryWrapper<N> {
         address: Address,
         index: StorageKey,
     ) -> Result<StorageValue, Self::Error> {
-        let provider = self.inner.latest().unwrap();
+        let provider = &self.0;
         let val = provider.storage(address, index.into());
         match val {
             Ok(Some(val)) => Ok(val.into()),
@@ -349,13 +362,81 @@ impl<N: ProviderNodeTypes> DatabaseRef for ProviderFactoryWrapper<N> {
     }
 }
 
-impl<N: ProviderNodeTypes> Deref for ProviderFactoryWrapper<N> {
-    type Target = ProviderFactory<N>;
+// impl<N: ProviderNodeTypes> DatabaseRef for ProviderFactoryWrapper<N> {
+//     #[doc = " The database error type."]
+//     type Error = MyError;
 
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
+//     #[doc = " Gets basic account information."]
+//     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+//         let provider: Box<dyn StateProvider> = self.inner.latest().unwrap();
+//         let acct = provider.basic_account(&address);
+//         match acct {
+//             Ok(Some(acct)) => {
+//                 // must get code along with basic account.
+//                 let code_hash = acct.get_bytecode_hash();
+//                 let code = if code_hash != KECCAK256_EMPTY {
+//                     Some(
+//                         provider
+//                             .bytecode_by_hash(&code_hash)
+//                             .unwrap()
+//                             .unwrap()
+//                             .into(),
+//                     )
+//                 } else {
+//                     None
+//                 };
+//                 let mut acct_info: AccountInfo = acct.into();
+//                 acct_info.code = code;
+//                 Ok(Some(acct_info))
+//             }
+//             Ok(None) => Ok(None),
+//             Err(_) => panic!("provider basic_ref error,addr:{:?}", address),
+//         }
+//     }
+
+//     #[doc = " Gets account code by its hash."]
+//     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+//         let provider = self.inner.latest().unwrap();
+//         let code = provider.bytecode_by_hash(&code_hash);
+//         match code {
+//             Ok(Some(code)) => Ok(code.into()),
+//             Ok(None) => Err(MyError {
+//                 message: format!("code for codehash:{code_hash} not found"),
+//             }),
+//             Err(_) => panic!("provider code_by_hash_ref error,code_hash:{:?}", code_hash),
+//         }
+//     }
+
+//     #[doc = " Gets storage value of address at index."]
+//     fn storage_ref(
+//         &self,
+//         address: Address,
+//         index: StorageKey,
+//     ) -> Result<StorageValue, Self::Error> {
+//         let provider = self.inner.latest().unwrap();
+//         let val = provider.storage(address, index.into());
+//         match val {
+//             Ok(Some(val)) => Ok(val.into()),
+//             Ok(None) => Err(MyError {
+//                 message: format!("storage for addr:{address}, key:{index} not found"),
+//             }),
+//             Err(_) => panic!("provider storage_ref error, addr:{address}, key:{index}"),
+//         }
+//     }
+
+//     #[doc = " Gets block hash by block number."]
+//     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+//         todo!()
+//     }
+// }
+
+// impl<N: ProviderNodeTypes> Deref for ProviderFactoryWrapper<N> {
+//     type Target = ProviderFactory<N>;
+
+//     fn deref(&self) -> &Self::Target {
+//         &self.inner
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
@@ -368,7 +449,7 @@ mod tests {
 
     use super::*;
     fn provider_with_db_type(mock: bool) {
-        let provider: Box<dyn ProviderRW<Error = MyError>> = if mock {
+        let factory: Box<dyn ProviderRW> = if mock {
             let p = ProviderFactoryWrapper::<EthereumNode>::new("./temp".into());
             Box::new(p)
         } else {
@@ -397,9 +478,10 @@ mod tests {
         storage.insert(key, value);
 
         // set initial state in db
-        provider.set_preblock_state(&prestate);
-        provider.set_storage(addr, storage);
+        factory.set_preblock_state(&prestate);
+        factory.set_storage(addr, storage);
 
+        let provider = factory.lastest_provider_ro();
         // fetch account
         assert!(matches!(provider.basic_ref(addr), Ok(Some(acct_info)) if acct_info == acct));
         // fetch storage
@@ -434,9 +516,11 @@ mod tests {
         c1.accounts.insert(addr2, cache_acct_1.clone());
         p.set_preblock_state(&c1);
 
-        assert!(matches!(p.storage_ref(addr2, slot_key), Ok(val) if val == slot_val));
+        assert!(
+            matches!(p.lastest_provider_ro().storage_ref(addr2, slot_key), Ok(val) if val == slot_val)
+        );
 
-        let provider = Some(p);
+        let factory = Some(p);
 
         let mut bal = Bal::default();
         let mut acct_bal = AccountBal::default();
@@ -473,33 +557,36 @@ mod tests {
         bal.accounts.insert(addr2, acct_bal);
 
         // commit bal changes to db
-        if let Some(p) = provider.as_ref() {
+        if let Some(p) = factory.as_ref() {
             // let p = provider.as_ref().unwrap();
             p.commit_bal_changes(&bal, 0);
 
+            let provider = p.lastest_provider_ro();
             // verify changes
             assert!(
-                matches!(p.basic_ref(addr1), Ok(Some(acct_info)) if acct_info.nonce == 2 && acct_info.balance == U256::from(2000u64) && acct_info.code_hash == KECCAK_EMPTY)
+                matches!(provider.basic_ref(addr1), Ok(Some(acct_info)) if acct_info.nonce == 2 && acct_info.balance == U256::from(2000u64) && acct_info.code_hash == KECCAK_EMPTY)
             );
             assert!(
-                matches!(p.basic_ref(addr2), Ok(Some(acct_info)) if acct_info.code_hash == code_hash)
+                matches!(provider.basic_ref(addr2), Ok(Some(acct_info)) if acct_info.code_hash == code_hash)
             );
             assert!(
-                matches!(p.code_by_hash_ref(code_hash), Ok(code_1) if code_1 == code && keccak256(code_1.original_bytes()) == code_hash)
+                matches!(provider.code_by_hash_ref(code_hash), Ok(code_1) if code_1 == code && keccak256(code_1.original_bytes()) == code_hash)
             );
-            assert!(matches!(p.storage_ref(addr2, slot_key), Ok(val) if val == slot_val_new));
+            assert!(
+                matches!(provider.storage_ref(addr2, slot_key), Ok(val) if val == slot_val_new)
+            );
         }
     }
 
     #[test]
     fn test_mainnet_data() {
-        let provider = ProviderFactoryWrapper::<EthereumNode>::new(
+        let factory = ProviderFactoryWrapper::<EthereumNode>::new(
             "/root/test_nodes/ethereum/execution/reth_full_bak".into(),
         );
 
-        let bn = provider.inner.best_block_number().unwrap();
+        let bn = factory.inner.best_block_number().unwrap();
         println!("best block number:{}", bn);
-        let bn = provider
+        let bn = factory
             .inner
             .provider()
             .unwrap()
@@ -507,7 +594,7 @@ mod tests {
             .unwrap()
             .unwrap();
         println!("last block number:{:?}", bn);
-        let provider_rw = provider.inner.provider_rw().unwrap();
+        let provider_rw = factory.inner.provider_rw().unwrap();
 
         // let bn = 23769999;
         provider_rw.save_finalized_block_number(bn).unwrap();
@@ -515,6 +602,7 @@ mod tests {
         // set some accounts
         let addr = address!("0xdAC17F958D2ee523a2206206994597C13D831ec7");
 
+        let provider = factory.lastest_provider_ro();
         // fetch account
         let acct = provider.basic_ref(addr).unwrap();
         println!("acct:{:?}", acct);

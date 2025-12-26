@@ -46,6 +46,7 @@ revm = { workspace = true, features = [
 ] }
 eyre.workspace = true
 rayon.workspace = true
+dashmap.workspace = true
 
 [lints]
 workspace = true
