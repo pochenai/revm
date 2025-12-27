@@ -131,26 +131,44 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
         let db_tx = provider.into_tx();
 
         for (addr, all) in &prestate.accounts {
-            if let Some(acct) = &all.info {
+            // if acct doesn't exist, we must set it to None! Or the mainnet db state will be incorrect!
+            let acct = match &all.info {
+                Some(v) => v,
+                None => &AccountInfo::default(),
+            };
+            db_tx
+                .put::<tables::PlainAccountState>(*addr, acct.into())
+                .unwrap();
+            if let Some(code) = &acct.code {
                 db_tx
-                    .put::<tables::PlainAccountState>(*addr, acct.into())
+                    .put::<tables::Bytecodes>(acct.code_hash, code.clone().into())
                     .unwrap();
-                if let Some(code) = &acct.code {
-                    db_tx
-                        .put::<tables::Bytecodes>(acct.code_hash, code.clone().into())
-                        .unwrap();
-                }
             }
 
             for (key, value) in &all.storage {
+                let mut cursor = db_tx
+                    .cursor_dup_write::<tables::PlainStorageState>()
+                    .unwrap();
+                let entry = StorageEntry::new((*key).into(), value.clone().into());
+                if let Some(mut db_entry) = cursor.seek_by_key_subkey(*addr, entry.key).unwrap() {
+                    loop {
+                        // Break if the subkey changes, to prevent iterating into a different dup range.
+                        if db_entry.key != entry.key {
+                            break;
+                        }
+
+                        cursor.delete_current().unwrap();
+
+                        match cursor.next_dup().unwrap() {
+                            Some((addr, next)) => {
+                                db_entry = next;
+                            }
+                            None => break,
+                        }
+                    }
+                }
                 db_tx
-                    .put::<tables::PlainStorageState>(
-                        *addr,
-                        StorageEntry {
-                            key: key.clone().into(),
-                            value: value.clone(),
-                        },
-                    )
+                    .put::<tables::PlainStorageState>(*addr, entry)
                     .unwrap();
             }
         }
@@ -258,11 +276,25 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
                         (*key).into(),
                         bal_writes.writes.last().unwrap().1.into(),
                     );
-                    if let Some(db_entry) = cursor.seek_by_key_subkey(*addr, entry.key).unwrap() {
-                        // must delete existing plainStorage first, becaust put in plainStorage is actually append then sort. If use get, you'll alway get the smallest slot value instead of the recent value.
-                        // ref: https://github.com/paradigmxyz/reth/blob/a672700b4fae17fc3622a93e62e7fefe64ccc78d/crates/storage/provider/src/providers/database/provider.rs#L1786
-                        if db_entry.key == entry.key {
+
+                    // must delete existing plainStorage first, becaust put in plainStorage is actually append then sort. If use get, you'll alway get the smallest slot value instead of the recent value.
+                    // ref: https://github.com/paradigmxyz/reth/blob/a672700b4fae17fc3622a93e62e7fefe64ccc78d/crates/storage/provider/src/providers/database/provider.rs#L1786
+                    if let Some(mut db_entry) = cursor.seek_by_key_subkey(*addr, entry.key).unwrap()
+                    {
+                        loop {
+                            // Break if the subkey changes, to prevent iterating into a different dup range.
+                            if db_entry.key != entry.key {
+                                break;
+                            }
+
                             cursor.delete_current().unwrap();
+
+                            match cursor.next_dup().unwrap() {
+                                Some((addr, next)) => {
+                                    db_entry = next;
+                                }
+                                None => break,
+                            }
                         }
                     }
 
@@ -335,6 +367,7 @@ impl DatabaseRef for LatestProvider {
             Ok(None) => Err(MyError {
                 message: format!("code for codehash:{code_hash} not found"),
             }),
+            // Ok(None) => Ok(Bytecode::new()),
             Err(_) => panic!("provider code_by_hash_ref error,code_hash:{:?}", code_hash),
         }
     }
@@ -349,9 +382,7 @@ impl DatabaseRef for LatestProvider {
         let val = provider.storage(address, index.into());
         match val {
             Ok(Some(val)) => Ok(val.into()),
-            Ok(None) => Err(MyError {
-                message: format!("storage for addr:{address}, key:{index} not found"),
-            }),
+            Ok(None) => Ok(StorageValue::default()),
             Err(_) => panic!("provider storage_ref error, addr:{address}, key:{index}"),
         }
     }
@@ -441,6 +472,7 @@ impl DatabaseRef for LatestProvider {
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{address, hex, keccak256, U256};
+    use reth_primitives_traits::Account;
     use revm::{
         context::block_states::MyPlainAccount,
         primitives::KECCAK_EMPTY,
@@ -599,13 +631,14 @@ mod tests {
         // let bn = 23769999;
         provider_rw.save_finalized_block_number(bn).unwrap();
         provider_rw.commit().unwrap();
-        // set some accounts
+        // get some accounts
         let addr = address!("0xdAC17F958D2ee523a2206206994597C13D831ec7");
+        let addr = address!("0x70bC1e16513aD49Bd28c20b7b50679381a71ADF5");
 
         let provider = factory.lastest_provider_ro();
         // fetch account
         let acct = provider.basic_ref(addr).unwrap();
-        println!("acct:{:?}", acct);
+        println!("acct:{:?}", Account::from(acct.clone().unwrap()));
 
         if let Some(acct) = acct {
             // fetch storage

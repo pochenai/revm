@@ -14,23 +14,13 @@ use flatdb::{
     ProviderRW,
 };
 use revm::{
-    context::{
-        block_states::{
-            envelope_to_txenv, import_struct, prestates_to_cachedbs, write_data, PreBlockState,
-            RecoveredBlockVec, RethBlock,
-        },
-        BlockEnv,
-    },
-    context_interface::block::{self, BlobExcessGasAndPrice},
-    database::{
-        bal::BalDatabase,
-        states::{cache::MyError, CacheAccount},
-        CacheState, PlainAccount, State,
-    },
-    precompile::kzg_point_evaluation::init_load_kzg_trusted_setup,
-    primitives::{address, alloy_primitives, hardfork::SpecId, Address, B256, KECCAK_EMPTY, U256},
-    state::bal::Bal,
-    Context, DatabaseRef, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
+    Context, DatabaseRef, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext, context::{
+        BlockEnv, block_states::{
+            PreBlockState, RecoveredBlockVec, RethBlock, envelope_to_txenv, import_struct, prestates_to_cachedbs, write_data
+        }
+    }, context_interface::block::{self, BlobExcessGasAndPrice}, database::{
+        self, CacheState, PlainAccount, State, bal::{BalDatabase, DEBUG}, states::{CacheAccount, cache::MyError}
+    }, precompile::{bn254::pair, kzg_point_evaluation::init_load_kzg_trusted_setup}, primitives::{Address, B256, KECCAK_EMPTY, U256, address, alloy_primitives, hardfork::SpecId}, state::bal::Bal
 };
 
 use alloy_consensus::{transaction::Recovered, Block, EthereumTxEnvelope, Transaction, TxEip4844};
@@ -117,6 +107,10 @@ pub struct Cmd {
     datadir: Option<String>,
     #[arg(long, value_enum, default_value = "none")]
     io: IOPattern,
+    #[arg(long, default_value_t = false)]
+    recover_db: bool,
+    #[arg(long, default_value_t = false)]
+    mock_db: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, Default)]
@@ -226,19 +220,33 @@ impl Cmd {
             RecoveredBlockVec(recovered_blocks).into();
 
         let database_provider = self.datadir.as_ref().map(|datadir| {
-            // let provider_rw = flatdb::MainnetProviderRW::new(datadir.into());
-            // let db_finalized_bn = provider_rw.last_finalized_block_number().unwrap();
-            // if db_finalized_bn != blocks[0].number - 1 {
-            //     panic!("Database finalized block number {} does not match the first block's parent number {}. Please ensure the database is synced to the correct state.", db_finalized_bn, blocks[0].number - 1);
-            // }
-            // println!("Database {} loaded at finalized block number {}", datadir,db_finalized_bn);
-            // DBProvider::MainnetDB(provider_rw)
-
-            let provider_rw = MockProviderRW::new(datadir.into());
-            let all_pre_state = derive_pre_all_execution_state(&prestates);
-            provider_rw.set_preblock_state(&all_pre_state);
-            provider_rw
+            if self.mock_db {
+                let datadir = "./tmp";
+                println!("MockDatabase at {} is loaded", datadir);
+                let provider_rw = MockProviderRW::new(datadir.into());
+                let all_pre_state = derive_pre_all_execution_state(&prestates);
+                provider_rw.set_preblock_state(&all_pre_state);
+                DBProvider::MockDB(provider_rw) 
+            } else {
+                let provider_rw = flatdb::MainnetProviderRW::new(datadir.into());
+                let db_finalized_bn = provider_rw.last_finalized_block_number().unwrap();
+                if db_finalized_bn != blocks[0].number - 1 {
+                    panic!("Database finalized block number {} does not match the first block's parent number {}. Please ensure the database is synced to the correct state.", db_finalized_bn, blocks[0].number - 1);
+                }
+                println!("Database {} loaded at finalized block number {}", datadir,db_finalized_bn);
+                DBProvider::MainnetDB(provider_rw) 
+            }
         });
+
+        // recover db seperately, then drop caches and re-run to avoid prefetching effect.
+        if self.recover_db {
+            if let Some(provider_rw) = database_provider {
+                let all_pre_state = derive_pre_all_execution_state(&prestates);
+                provider_rw.set_preblock_state(&all_pre_state);
+                println!("state rewinds to block at {}", blocks[0].number-1);
+            }
+            return Ok(());
+        }
 
         let caches = prestates_to_cachedbs(prestates);
 
@@ -858,11 +866,11 @@ fn execute_blocks_par_scheduler(
     total_gas_used
 }
 
-fn execute_blocks_par<P: ProviderNodeTypes>(
+fn execute_blocks_par(
     blocks: Vec<RethBlock>,
     batch_merged_bals: Vec<Bal>,
     prestates: Vec<Either<CacheState, Vec<CacheState>>>,
-    db_rw: Option<ProviderFactoryWrapper<P>>,
+    db_rw: Option<DBProvider>,
     block_hashes: BTreeMap<u64, B256>,
     txs_gas_used: Vec<Vec<u64>>,
     cmd_env: &Cmd,

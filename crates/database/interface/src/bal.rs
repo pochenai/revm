@@ -118,12 +118,15 @@ impl<ERROR: Display> Display for BalDatabaseError<ERROR> {
 
 impl<ERROR: Error> Error for BalDatabaseError<ERROR> {}
 
-const DEBUG: bool = false;
+/// control where log db access.
+pub static mut DEBUG: bool = false;
 
 macro_rules! dprintln {
     ($($arg:tt)*) => {
-        if DEBUG {
-            println!($($arg)*);
+        unsafe {
+            if DEBUG {
+                println!($($arg)*);
+            }
         }
     };
 }
