@@ -10,8 +10,7 @@ use crossbeam::channel::unbounded;
 
 use alloy_primitives::{bytes, Bytes};
 use flatdb::{
-    mtcache::MTCache, MainnetProviderRW, MockProviderRW, ProviderFactoryWrapper, ProviderNodeTypes,
-    ProviderRW,
+    MainnetProviderRW, MockProviderRW, ProviderRW, mtcache::{MTCache, SharedCache}
 };
 use revm::{
     Context, DatabaseRef, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext, context::{
@@ -154,6 +153,7 @@ enum DBProvider {
 impl Deref for DBProvider {
     type Target = dyn flatdb::ProviderRW;
 
+    // same as as_rw, just for convenent usage.
     fn deref(&self) -> &Self::Target {
         match self {
             DBProvider::MockDB(db) => db as _,
@@ -163,10 +163,19 @@ impl Deref for DBProvider {
 }
 
 impl DBProvider {
-    pub fn as_rw(&mut self) -> &mut dyn flatdb::ProviderRW {
+    pub fn as_rw(&self) -> &dyn flatdb::ProviderRW {
         match self {
             DBProvider::MockDB(db) => db,
             DBProvider::MainnetDB(db) => db,
+        }
+    }
+
+
+    // It's much slower compare to lastest_provider_ro, due to, it'll alloc a Boxed latest provider for each read.
+    pub fn as_ro(&self) -> Box<dyn DatabaseRef<Error = MyError>+ Sync+'_>  {
+        match self {
+            DBProvider::MockDB(db) => Box::new(db),
+            DBProvider::MainnetDB(db) =>Box::new(db),
         }
     }
 }
@@ -242,7 +251,7 @@ impl Cmd {
         if self.recover_db {
             if let Some(provider_rw) = database_provider {
                 let all_pre_state = derive_pre_all_execution_state(&prestates);
-                provider_rw.set_preblock_state(&all_pre_state);
+                provider_rw.as_rw().set_preblock_state(&all_pre_state);
                 println!("state rewinds to block at {}", blocks[0].number-1);
             }
             return Ok(());
@@ -896,9 +905,8 @@ fn execute_blocks_par(
             tx_offset += b.body.transactions.len() as u64 + 2;
         });
 
-        let cached_db = db_rw
-            .as_ref()
-            .and_then(|db| Some(MTCache::new(db.lastest_provider_ro())));
+        let shared_cache = Arc::new(SharedCache::new());
+
         let chunk_results = chunk_blocks
             .par_iter()
             .enumerate()
@@ -929,8 +937,8 @@ fn execute_blocks_par(
                         if cmd_env.skip_7702 && tx.is_eip7702() {
                             return (tx_index as u64, 0, Duration::ZERO, tx, i, 0);
                         }
-                        let (prestate, bal) = match cached_db.as_ref() {
-                            Some(db) => (Either::Left(db), Some(bal_ref)),
+                        let (prestate, bal) = match db_rw.as_ref() {
+                            Some(db) => (Either::Left(MTCache::new(db.as_rw().lastest_provider_ro(), Arc::clone(&shared_cache))), Some(bal_ref)),
                             None => {
                                 let block_idx = i + chunk_idx * batch;
                                 let cache = &prestates[block_idx];
@@ -975,7 +983,7 @@ fn execute_blocks_par(
         let commit_start = Instant::now();
         current_bn += chunk_blocks.len() as u64;
         if let Some(db) = db_rw.as_ref() {
-            db.commit_bal_changes(batch_merged_bal, current_bn);
+            db.as_rw().commit_bal_changes(batch_merged_bal, current_bn);
         }
         commit_time += commit_start.elapsed();
 

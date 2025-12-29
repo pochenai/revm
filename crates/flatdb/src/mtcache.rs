@@ -1,5 +1,7 @@
 //! Thread safe cache provider
 
+use std::sync::Arc;
+
 use dashmap::{DashMap, Entry::Occupied, Entry::Vacant};
 use revm::database::states::cache::MyError;
 use revm::primitives::StorageKey;
@@ -9,11 +11,9 @@ use revm::{bytecode::Bytecode, primitives::StorageValue};
 
 use alloy_primitives::{Address, B256};
 
-/// Thread safe cache provider for each batched block
+///
 #[derive(Debug)]
-pub struct MTCache<DB> {
-    /// Underling database
-    db: DB,
+pub struct SharedCache {
     /// Cached accounts
     accounts: DashMap<Address, Option<AccountInfo>>,
     /// Cached storage
@@ -22,18 +22,35 @@ pub struct MTCache<DB> {
     contracts: DashMap<B256, Bytecode>,
 }
 
+impl SharedCache {
+    /// creat a shared cache
+    pub fn new() -> Self {
+        Self {
+            accounts: DashMap::with_capacity_and_shard_amount(40000, 32),
+            storage: DashMap::with_capacity_and_shard_amount(160000, 32),
+            contracts: DashMap::with_capacity_and_shard_amount(40000, 32),
+        }
+    }
+}
+
+/// Thread safe cache provider for each batched block.
+/// Must creat a seperate provider for each evm-tx, because the underlying DB will treat all the read/write as a single db-tx.
+/// So if all evm-txs share the same provider, the db-tx is sequential!
+#[derive(Debug)]
+pub struct MTCache<DB> {
+    /// Underling database
+    db: DB,
+    /// Shared Cache
+    shared: Arc<SharedCache>,
+}
+
 impl<DB> MTCache<DB>
 where
     DB: DatabaseRef,
 {
     /// Create with a db
-    pub fn new(db: DB) -> Self {
-        Self {
-            db,
-            accounts: DashMap::default(),
-            storage: DashMap::default(),
-            contracts: DashMap::default(),
-        }
+    pub fn new(db: DB, shared: Arc<SharedCache>) -> Self {
+        Self { db, shared }
     }
 }
 
@@ -43,8 +60,8 @@ where
 /// - Return cached value if present (lock held briefly).
 ///
 /// Slow path:
-/// - Hold any DashMap locks while querying underlying DB to avoid multiple IOs.
-/// - Insert result into cache (benign race allowed).
+/// - query underlying DB to avoid holding locks too long (the db has cache too, so it's not a big problem even if we do multiple I/O for the same addr).
+/// - short lock shared cache and Insert result into cache (benign race allowed).
 impl<DB> DatabaseRef for MTCache<DB>
 where
     DB: DatabaseRef<Error = MyError>,
@@ -55,15 +72,17 @@ where
     #[doc = " Gets basic account information."]
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         // fast path：lock-fress clone
-        if let Some(v) = self.accounts.get(&address) {
+        if let Some(v) = self.shared.accounts.get(&address) {
             return Ok(v.clone());
         }
 
-        // Slow path: query DB while holding locks
-        match self.accounts.entry(address) {
+        // slow path: lock-free db access
+        let acct = self.db.basic_ref(address)?;
+
+        // short critical section
+        match self.shared.accounts.entry(address) {
             Occupied(e) => Ok(e.get().clone()),
             Vacant(e) => {
-                let acct = self.db.basic_ref(address)?;
                 e.insert(acct.clone());
                 Ok(acct)
             }
@@ -73,15 +92,17 @@ where
     #[doc = " Gets account code by its hash."]
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         // Fast path
-        if let Some(code) = self.contracts.get(&code_hash) {
+        if let Some(code) = self.shared.contracts.get(&code_hash) {
             return Ok(code.clone());
         }
 
-        // Slow path: query DB while holding locks
-        match self.contracts.entry(code_hash) {
+        // slow path: lock-free db access
+        let code = self.db.code_by_hash_ref(code_hash)?;
+
+        // short critical section
+        match self.shared.contracts.entry(code_hash) {
             Occupied(e) => Ok(e.get().clone()),
             Vacant(e) => {
-                let code = self.db.code_by_hash_ref(code_hash)?;
                 e.insert(code.clone());
                 Ok(code)
             }
@@ -95,19 +116,28 @@ where
         index: StorageKey,
     ) -> Result<StorageValue, Self::Error> {
         // Fast path: address + slot both cached
-        if let Some(inner) = self.storage.get(&address) {
+        if let Some(inner) = self.shared.storage.get(&address) {
             if let Some(val) = inner.get(&index) {
                 return Ok(*val);
             }
         }
 
-        // Slow path: query DB while holding locks
-        // Ensure inner map exists, then insert value
-        let inner = self.storage.entry(address).or_insert_with(DashMap::default);
+        // Slow path: lock-free db access
         let val = self.db.storage_ref(address, index)?;
-        inner.insert(index, val);
-
-        Ok(val)
+        // Ensure inner map exists, then insert value
+        let inner = self
+            .shared
+            .storage
+            .entry(address)
+            .or_insert_with(DashMap::default);
+        let res = match inner.entry(index) {
+            Occupied(e) => Ok(e.get().clone()),
+            Vacant(e) => {
+                e.insert(val);
+                Ok(val)
+            }
+        };
+        res
     }
 
     #[doc = " Gets block hash by block number."]
@@ -164,7 +194,7 @@ mod tests {
             result: res.clone(),
         };
 
-        let cache = MTCache::new(db);
+        let cache = MTCache::new(db, Arc::new(SharedCache::new()));
 
         let addr = Address::random();
 
@@ -186,7 +216,9 @@ mod tests {
     #[test]
     fn test_basic_ref_cache_should_always_incur_one_io() {
         test_basic_ref_cache_hit(None, true);
-        test_basic_ref_cache_hit(None, false);
-        test_basic_ref_cache_hit(Some(AccountInfo::default()), false);
+        // Without prewarm, there might be multiple db access for the same addr,
+        // due to we want the critical section as small as possible.
+        // test_basic_ref_cache_hit(None, false);
+        // test_basic_ref_cache_hit(Some(AccountInfo::default()), false);
     }
 }

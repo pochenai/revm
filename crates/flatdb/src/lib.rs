@@ -49,7 +49,8 @@ pub trait ProviderRW {
     fn commit_bal_changes(&self, bal: &Bal, finalized_bn: BlockNumber);
     ///
     fn last_finalized_block_number(&self) -> Option<BlockNumber>;
-    ///
+    /// Create a shared provider for one tx to avoid redudant heap allocation,
+    ///  it's almost 50% faster than create a lastest provider for each read.
     fn lastest_provider_ro(&self) -> LatestProvider;
 }
 
@@ -393,73 +394,75 @@ impl DatabaseRef for LatestProvider {
     }
 }
 
-// impl<N: ProviderNodeTypes> DatabaseRef for ProviderFactoryWrapper<N> {
-//     #[doc = " The database error type."]
-//     type Error = MyError;
+// Don't use this provider due to it'll alloc a lastet provider for each read!
+// It only exists to experiment the performance diff.
+impl<N: ProviderNodeTypes> DatabaseRef for ProviderFactoryWrapper<N> {
+    #[doc = " The database error type."]
+    type Error = MyError;
 
-//     #[doc = " Gets basic account information."]
-//     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-//         let provider: Box<dyn StateProvider> = self.inner.latest().unwrap();
-//         let acct = provider.basic_account(&address);
-//         match acct {
-//             Ok(Some(acct)) => {
-//                 // must get code along with basic account.
-//                 let code_hash = acct.get_bytecode_hash();
-//                 let code = if code_hash != KECCAK256_EMPTY {
-//                     Some(
-//                         provider
-//                             .bytecode_by_hash(&code_hash)
-//                             .unwrap()
-//                             .unwrap()
-//                             .into(),
-//                     )
-//                 } else {
-//                     None
-//                 };
-//                 let mut acct_info: AccountInfo = acct.into();
-//                 acct_info.code = code;
-//                 Ok(Some(acct_info))
-//             }
-//             Ok(None) => Ok(None),
-//             Err(_) => panic!("provider basic_ref error,addr:{:?}", address),
-//         }
-//     }
+    #[doc = " Gets basic account information."]
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        let provider: Box<dyn StateProvider> = self.inner.latest().unwrap();
+        let acct = provider.basic_account(&address);
+        match acct {
+            Ok(Some(acct)) => {
+                // must get code along with basic account.
+                let code_hash = acct.get_bytecode_hash();
+                let code = if code_hash != KECCAK256_EMPTY {
+                    Some(
+                        provider
+                            .bytecode_by_hash(&code_hash)
+                            .unwrap()
+                            .unwrap()
+                            .into(),
+                    )
+                } else {
+                    None
+                };
+                let mut acct_info: AccountInfo = acct.into();
+                acct_info.code = code;
+                Ok(Some(acct_info))
+            }
+            Ok(None) => Ok(None),
+            Err(_) => panic!("provider basic_ref error,addr:{:?}", address),
+        }
+    }
 
-//     #[doc = " Gets account code by its hash."]
-//     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-//         let provider = self.inner.latest().unwrap();
-//         let code = provider.bytecode_by_hash(&code_hash);
-//         match code {
-//             Ok(Some(code)) => Ok(code.into()),
-//             Ok(None) => Err(MyError {
-//                 message: format!("code for codehash:{code_hash} not found"),
-//             }),
-//             Err(_) => panic!("provider code_by_hash_ref error,code_hash:{:?}", code_hash),
-//         }
-//     }
+    #[doc = " Gets account code by its hash."]
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        let provider = self.inner.latest().unwrap();
+        let code = provider.bytecode_by_hash(&code_hash);
+        match code {
+            Ok(Some(code)) => Ok(code.into()),
+            Ok(None) => Err(MyError {
+                message: format!("code for codehash:{code_hash} not found"),
+            }),
+            Err(_) => panic!("provider code_by_hash_ref error,code_hash:{:?}", code_hash),
+        }
+    }
 
-//     #[doc = " Gets storage value of address at index."]
-//     fn storage_ref(
-//         &self,
-//         address: Address,
-//         index: StorageKey,
-//     ) -> Result<StorageValue, Self::Error> {
-//         let provider = self.inner.latest().unwrap();
-//         let val = provider.storage(address, index.into());
-//         match val {
-//             Ok(Some(val)) => Ok(val.into()),
-//             Ok(None) => Err(MyError {
-//                 message: format!("storage for addr:{address}, key:{index} not found"),
-//             }),
-//             Err(_) => panic!("provider storage_ref error, addr:{address}, key:{index}"),
-//         }
-//     }
+    #[doc = " Gets storage value of address at index."]
+    fn storage_ref(
+        &self,
+        address: Address,
+        index: StorageKey,
+    ) -> Result<StorageValue, Self::Error> {
+        let provider = self.inner.latest().unwrap();
+        let val = provider.storage(address, index.into());
+        match val {
+            Ok(Some(val)) => Ok(val.into()),
+            Ok(None) => Err(MyError {
+                message: format!("storage for addr:{address}, key:{index} not found"),
+            }),
+            Err(_) => panic!("provider storage_ref error, addr:{address}, key:{index}"),
+        }
+    }
 
-//     #[doc = " Gets block hash by block number."]
-//     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
-//         todo!()
-//     }
-// }
+    #[doc = " Gets block hash by block number."]
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        todo!()
+    }
+}
 
 // impl<N: ProviderNodeTypes> Deref for ProviderFactoryWrapper<N> {
 //     type Target = ProviderFactory<N>;
