@@ -1,8 +1,11 @@
 //! Thread safe cache provider
 
+use std::collections::VecDeque;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use dashmap::{DashMap, Entry::Occupied, Entry::Vacant};
+use revm::context::block_states::PreBlockState;
 use revm::database::states::cache::MyError;
 use revm::primitives::StorageKey;
 use revm::state::AccountInfo;
@@ -26,10 +29,40 @@ impl SharedCache {
     /// creat a shared cache
     pub fn new() -> Self {
         Self {
-            accounts: DashMap::with_capacity_and_shard_amount(40000, 32),
+            accounts: DashMap::with_capacity_and_shard_amount(80000, 32),
             storage: DashMap::with_capacity_and_shard_amount(160000, 32),
             contracts: DashMap::with_capacity_and_shard_amount(40000, 32),
         }
+    }
+}
+
+///
+pub trait Iterable {
+    /// Latest state should always be in the front!
+    type Iter<'a>: Iterator<Item = &'a PreBlockState>
+    where
+        Self: 'a;
+    /// create a iterator from the underlying type
+    fn iter(&self) -> Self::Iter<'_>;
+}
+
+impl Iterable for &Vec<PreBlockState> {
+    type Iter<'a>
+        = std::slice::Iter<'a, PreBlockState>
+    where
+        Self: 'a;
+    fn iter(&self) -> Self::Iter<'_> {
+        <Vec<PreBlockState> as std::ops::Deref>::deref(self).iter()
+    }
+}
+
+impl Iterable for &VecDeque<PreBlockState> {
+    type Iter<'a>
+        = std::collections::vec_deque::Iter<'a, PreBlockState>
+    where
+        Self: 'a;
+    fn iter(&self) -> Self::Iter<'_> {
+        <VecDeque<PreBlockState>>::iter(self)
     }
 }
 
@@ -37,20 +70,29 @@ impl SharedCache {
 /// Must creat a seperate provider for each evm-tx, because the underlying DB will treat all the read/write as a single db-tx.
 /// So if all evm-txs share the same provider, the db-tx is sequential!
 #[derive(Debug)]
-pub struct MTCache<DB> {
+pub struct MTCache<DB, MEM>
+where
+    MEM: Iterable,
+{
     /// Underling database
     db: DB,
     /// Shared Cache
     shared: Arc<SharedCache>,
+    in_memory: Option<MEM>,
 }
 
-impl<DB> MTCache<DB>
+impl<DB, MEM> MTCache<DB, MEM>
 where
     DB: DatabaseRef,
+    MEM: Iterable,
 {
     /// Create with a db
-    pub fn new(db: DB, shared: Arc<SharedCache>) -> Self {
-        Self { db, shared }
+    pub fn new(db: DB, shared: Arc<SharedCache>, in_memory: Option<MEM>) -> Self {
+        Self {
+            db,
+            shared,
+            in_memory,
+        }
     }
 }
 
@@ -62,15 +104,23 @@ where
 /// Slow path:
 /// - query underlying DB to avoid holding locks too long (the db has cache too, so it's not a big problem even if we do multiple I/O for the same addr).
 /// - short lock shared cache and Insert result into cache (benign race allowed).
-impl<DB> DatabaseRef for MTCache<DB>
+impl<DB, MEM> DatabaseRef for MTCache<DB, MEM>
 where
     DB: DatabaseRef<Error = MyError>,
+    MEM: Iterable,
 {
     #[doc = " The database error type."]
     type Error = MyError;
 
     #[doc = " Gets basic account information."]
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        if let Some(mem) = &self.in_memory {
+            for state in mem.iter() {
+                if let Some(acct) = state.accounts.get(&address) {
+                    return Ok(acct.info.clone());
+                }
+            }
+        }
         // fast path：lock-fress clone
         if let Some(v) = self.shared.accounts.get(&address) {
             return Ok(v.clone());
@@ -91,6 +141,10 @@ where
 
     #[doc = " Gets account code by its hash."]
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        if let Some(mem) = &self.in_memory {
+            // not neccesary due to it's already returned by the basic_ref.
+        }
+
         // Fast path
         if let Some(code) = self.shared.contracts.get(&code_hash) {
             return Ok(code.clone());
@@ -115,6 +169,15 @@ where
         address: Address,
         index: StorageKey,
     ) -> Result<StorageValue, Self::Error> {
+        if let Some(mem) = &self.in_memory {
+            for state in mem.iter() {
+                if let Some(acct) = state.accounts.get(&address) {
+                    if let Some(val) = acct.storage.get(&index) {
+                        return Ok(val.clone());
+                    }
+                }
+            }
+        }
         // Fast path: address + slot both cached
         if let Some(inner) = self.shared.storage.get(&address) {
             if let Some(val) = inner.get(&index) {
@@ -194,7 +257,8 @@ mod tests {
             result: res.clone(),
         };
 
-        let cache = MTCache::new(db, Arc::new(SharedCache::new()));
+        let cache: MTCache<MockDB, &Vec<PreBlockState>> =
+            MTCache::new(db, Arc::new(SharedCache::new()), None);
 
         let addr = Address::random();
 

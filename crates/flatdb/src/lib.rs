@@ -23,6 +23,8 @@ pub use reth_provider::{
     test_utils::MockNodeTypesWithDB,
     ProviderFactory, *,
 };
+use revm::context::block_states::MyPlainAccount;
+use revm::database::states::plain_account::PlainStorage;
 use revm::{
     context::block_states::PreBlockState,
     database::{states::cache::MyError, CacheState},
@@ -46,7 +48,7 @@ pub trait ProviderRW {
     ///
     fn set_storage(&self, addr: Address, storage: HashMap<StorageKey, StorageValue>);
     ///
-    fn commit_bal_changes(&self, bal: &Bal, finalized_bn: BlockNumber);
+    fn commit_bal_changes(&self, bal: &Bal, finalized_bn: BlockNumber) -> PreBlockState;
     ///
     fn last_finalized_block_number(&self) -> Option<BlockNumber>;
     /// Create a shared provider for one tx to avoid redudant heap allocation,
@@ -222,7 +224,8 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
         provider.commit().unwrap();
     }
 
-    fn commit_bal_changes(&self, bal: &Bal, finalized_bn: BlockNumber) {
+    fn commit_bal_changes(&self, bal: &Bal, finalized_bn: BlockNumber) -> PreBlockState {
+        let mut latest_state = PreBlockState::default();
         let factory = self.inner.provider_rw().unwrap();
         let provider_ro = self.inner.provider().unwrap();
         let db_tx = factory.into_tx();
@@ -255,18 +258,21 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
             if max_bal_index > 1 {
                 bal.populate_account_info(*addr, max_bal_index as _, &mut info)
                     .unwrap();
-
-                if info.is_empty() {
-                    db_tx
-                        .delete::<tables::PlainAccountState>(*addr, Some(prev_info))
-                        .unwrap();
-                } else {
-                    db_tx
-                        .put::<tables::PlainAccountState>(*addr, info.into())
-                        .unwrap();
-                }
             }
 
+            let latest_info = info.clone();
+
+            if info.is_empty() {
+                db_tx
+                    .delete::<tables::PlainAccountState>(*addr, Some(prev_info))
+                    .unwrap();
+            } else {
+                db_tx
+                    .put::<tables::PlainAccountState>(*addr, info.into())
+                    .unwrap();
+            }
+
+            let mut latest_storage = PlainStorage::default();
             // update changed storages in database
             for (key, bal_writes) in storage_bals.storage.iter() {
                 if bal_writes.writes.len() > 0 {
@@ -277,6 +283,8 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
                         (*key).into(),
                         bal_writes.writes.last().unwrap().1.into(),
                     );
+
+                    latest_storage.insert(*key, bal_writes.writes.last().unwrap().1);
 
                     // must delete existing plainStorage first, becaust put in plainStorage is actually append then sort. If use get, you'll alway get the smallest slot value instead of the recent value.
                     // ref: https://github.com/paradigmxyz/reth/blob/a672700b4fae17fc3622a93e62e7fefe64ccc78d/crates/storage/provider/src/providers/database/provider.rs#L1786
@@ -302,6 +310,13 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
                     cursor.upsert(*addr, &entry).expect("upsert error");
                 }
             }
+
+            let latest_acct = MyPlainAccount {
+                info: Some(latest_info),
+                storage: latest_storage,
+            };
+
+            latest_state.accounts.insert(*addr, latest_acct);
         }
 
         db_tx.commit().unwrap();
@@ -310,6 +325,8 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
             .unwrap()
             .save_finalized_block_number(finalized_bn)
             .unwrap();
+
+        latest_state
     }
 
     fn last_finalized_block_number(&self) -> Option<BlockNumber> {

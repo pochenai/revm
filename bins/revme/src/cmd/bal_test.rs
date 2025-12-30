@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     iter::zip,
     ops::Deref,
     sync::Arc,
@@ -891,6 +891,8 @@ fn execute_blocks_par(
     let mut current_bn = blocks[0].number;
     let mut commit_time = Duration::ZERO;
 
+    let mut in_mem = VecDeque::with_capacity(2);
+
     let mut sum_longest_tx_time = Duration::ZERO;
     let block_hashes = Arc::new(block_hashes);
     for (chunk_idx, (chunk_blocks, batch_merged_bal)) in
@@ -938,7 +940,7 @@ fn execute_blocks_par(
                             return (tx_index as u64, 0, Duration::ZERO, tx, i, 0);
                         }
                         let (prestate, bal) = match db_rw.as_ref() {
-                            Some(db) => (Either::Left(MTCache::new(db.as_rw().lastest_provider_ro(), Arc::clone(&shared_cache))), Some(bal_ref)),
+                            Some(db) => (Either::Left(MTCache::new(db.as_rw().lastest_provider_ro(), Arc::clone(&shared_cache), Some(&in_mem))), Some(bal_ref)),
                             None => {
                                 let block_idx = i + chunk_idx * batch;
                                 let cache = &prestates[block_idx];
@@ -983,8 +985,14 @@ fn execute_blocks_par(
         let commit_start = Instant::now();
         current_bn += chunk_blocks.len() as u64;
         if let Some(db) = db_rw.as_ref() {
-            db.as_rw().commit_bal_changes(batch_merged_bal, current_bn);
+            let latest_state = db.as_rw().commit_bal_changes(batch_merged_bal, current_bn);
+            if in_mem.len() >= 2 {
+                in_mem.pop_back();
+                in_mem.push_front(latest_state);
+            }
         }
+
+
         commit_time += commit_start.elapsed();
 
         if debug {
