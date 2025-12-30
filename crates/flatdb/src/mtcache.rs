@@ -78,6 +78,7 @@ where
     db: DB,
     /// Shared Cache
     shared: Arc<SharedCache>,
+    /// The performance diff with or without last 2 block's state changes is minimal.
     in_memory: Option<MEM>,
 }
 

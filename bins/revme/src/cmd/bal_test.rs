@@ -986,12 +986,17 @@ fn execute_blocks_par(
         current_bn += chunk_blocks.len() as u64;
         if let Some(db) = db_rw.as_ref() {
             let latest_state = db.as_rw().commit_bal_changes(batch_merged_bal, current_bn);
+            // cache last 2 block's state changes
             if in_mem.len() >= 2 {
                 in_mem.pop_back();
-                in_mem.push_front(latest_state);
             }
+            in_mem.push_front(latest_state);
         }
 
+        // if chunk_idx==1 { // only for debug purpose
+        //     unsafe {DEBUG = false};
+        //     panic!("exit batch 1");
+        // }
 
         commit_time += commit_start.elapsed();
 

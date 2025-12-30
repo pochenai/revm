@@ -227,16 +227,15 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
     fn commit_bal_changes(&self, bal: &Bal, finalized_bn: BlockNumber) -> PreBlockState {
         let mut latest_state = PreBlockState::default();
         let factory = self.inner.provider_rw().unwrap();
-        let provider_ro = self.inner.provider().unwrap();
         let db_tx = factory.into_tx();
 
         for (addr, acct_bal) in bal.accounts.iter() {
             let info_bal = &acct_bal.account_info;
             let storage_bals = &acct_bal.storage;
 
-            // fetch changed account info first
-            let prev_info = provider_ro.basic_account(addr).unwrap().unwrap_or_default();
-            let mut info: AccountInfo = prev_info.clone().into();
+            // fetch changed account info first. Must use basic_ref instead of provider_ro.basic_account to also fetch code.
+            let prev_info = self.basic_ref(*addr).unwrap().unwrap_or_default();
+            let mut info: AccountInfo = prev_info.clone();
             let max_bal_index = info_bal
                 .balance
                 .writes
@@ -256,17 +255,17 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
             }
             // update changed account info in database
             if max_bal_index > 1 {
-                bal.populate_account_info(*addr, max_bal_index as _, &mut info)
-                    .unwrap();
+                acct_bal.populate_account_info(max_bal_index as _, &mut info);
             }
 
-            let latest_info = info.clone();
+            let mut latest_info = None;
 
             if info.is_empty() {
                 db_tx
-                    .delete::<tables::PlainAccountState>(*addr, Some(prev_info))
+                    .delete::<tables::PlainAccountState>(*addr, Some(prev_info.into()))
                     .unwrap();
             } else {
+                latest_info = Some(info.clone());
                 db_tx
                     .put::<tables::PlainAccountState>(*addr, info.into())
                     .unwrap();
@@ -312,7 +311,7 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
             }
 
             let latest_acct = MyPlainAccount {
-                info: Some(latest_info),
+                info: latest_info,
                 storage: latest_storage,
             };
 
@@ -336,6 +335,7 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
 
     /// create a lastest provider for a batched blocks.
     fn lastest_provider_ro(&self) -> LatestProvider {
+        // here the Boxed provider is returned. I've tried with non-boxed provider, but the perf diff is minimal.
         LatestProvider(self.inner.latest().unwrap())
     }
 }
