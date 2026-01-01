@@ -10,7 +10,7 @@ use crossbeam::channel::unbounded;
 
 use alloy_primitives::{bytes, Bytes};
 use flatdb::{
-    MainnetProviderRW, MockProviderRW, ProviderRW, mtcache::{MTCache, SharedCache}
+    MainnetProviderRW, MockProviderRW, ProviderRW, mtcache::{MTCache, SharedCache}, preblock_db_provider::PreBlockStateCache
 };
 use revm::{
     Context, DatabaseRef, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext, context::{
@@ -104,7 +104,7 @@ pub struct Cmd {
     pre_recover_sender: bool,
     #[arg(long)]
     datadir: Option<String>,
-    #[arg(long, value_enum, default_value = "none")]
+    #[arg(long, value_enum, default_value = "batched")]
     io: IOPattern,
     #[arg(long, default_value_t = false)]
     recover_db: bool,
@@ -136,11 +136,11 @@ pub enum PriorityOrder {
 
 #[derive(Clone, Debug, ValueEnum, Default)]
 pub enum IOPattern {
-    #[default]
-    #[clap(alias = "none")]
-    None,
     /// Parallel I/O with tx-parallelism.
+    #[clap(alias = "par")]
     Parallel,
+    #[default]
+    #[clap(alias = "batched")]
     /// Batched prefetching I/O given bal read locations.
     Batched,
 }
@@ -908,6 +908,22 @@ fn execute_blocks_par(
         });
 
         let shared_cache = Arc::new(SharedCache::new());
+        let preblock_fetcher  = match db_rw.as_ref() {
+            Some(db) => {
+                // batched prefetching pre-block state
+                let provider = match cmd_env.io {
+                    IOPattern::Batched => {
+                        let mut p = PreBlockStateCache::new(db.as_rw());
+                        p.batch_preblock_state(batch_merged_bal, cmd_env.threads * 2);
+                        println!("prefetched all state for blocks:[{}-{}]", start_block*(chunk_idx as u64), start_block*((chunk_idx as u64)+1));
+                        Some(p)
+                    },
+                    IOPattern::Parallel => None,
+                };
+                provider
+            },
+            None => None,
+        };
 
         let chunk_results = chunk_blocks
             .par_iter()
@@ -940,7 +956,19 @@ fn execute_blocks_par(
                             return (tx_index as u64, 0, Duration::ZERO, tx, i, 0);
                         }
                         let (prestate, bal) = match db_rw.as_ref() {
-                            Some(db) => (Either::Left(MTCache::new(db.as_rw().lastest_provider_ro(), Arc::clone(&shared_cache), Some(&in_mem))), Some(bal_ref)),
+                            Some(db) => {
+                                let prestate = match &preblock_fetcher {
+                                    Some(p) => Either::Left(Either::Left(p)),
+                                    None => {
+                                        // create a provider for each thread because read is a tx is rethdb.
+                                        let provider = db.as_rw().lastest_provider_ro();
+                                        let mt_cache = MTCache::new(provider, Arc::clone(&shared_cache), Some(&in_mem));
+                                        Either::Left(Either::Right(mt_cache))
+                                    }
+                                };
+                                (prestate, Some(bal_ref))
+                            }
+        
                             None => {
                                 let block_idx = i + chunk_idx * batch;
                                 let cache = &prestates[block_idx];

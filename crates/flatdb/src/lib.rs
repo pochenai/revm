@@ -38,7 +38,7 @@ use revm::bytecode::Bytecode;
 use crate::node::EthereumNode;
 
 ///
-pub trait ProviderRW {
+pub trait ProviderRW: Sync {
     ///
     fn set_preblock_state(&self, prestate: &PreBlockState);
     ///
