@@ -323,9 +323,10 @@ impl Cmd {
         );
 
         println!(
-            "total gas used:{}M, gas per second:{:?} MGas/s",
+            "total gas used:{}M, gas per second:{:?} MGas/s, execution time without commit:{:?}",
             gas_used / 1_000_000,
-            gas_used / ((elapsed - commit_time).as_millis() as u64) / 1000
+            gas_used / ((elapsed - commit_time).as_millis() as u64) / 1000,
+            elapsed - commit_time,
         );
 
         Ok(())
