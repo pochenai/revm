@@ -6,16 +6,23 @@ pub mod node;
 ///
 pub mod preblock_db_provider;
 
+use std::cell::{Cell, RefCell};
 use std::{ops::Deref, path::PathBuf, sync::Arc};
 
-use alloy_primitives::{address, b256, Address, BlockNumber, B256, KECCAK256_EMPTY, U256};
+use alloy_primitives::{
+    address, b256, hex, keccak256, Address, BlockNumber, B256, KECCAK256_EMPTY, U256,
+};
+use rayon::iter::Either;
 use reth_chainspec::{ChainSpec, MAINNET};
+use reth_db::transaction::CursorTy;
 use reth_db::{
     init_db, mdbx::DatabaseArguments, tables, test_utils::TempDatabase, transaction::DbTx,
     DatabaseEnv,
 };
 use reth_db_api::cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW};
 use reth_db_api::transaction::DbTxMut;
+use reth_db_api::Database as RethDatabase;
+use reth_node_types::NodeTypesWithDB;
 use reth_primitives_traits::StorageEntry;
 // re-export
 pub use reth_provider::{
@@ -25,6 +32,7 @@ pub use reth_provider::{
 };
 use revm::context::block_states::MyPlainAccount;
 use revm::database::states::plain_account::PlainStorage;
+use revm::Database;
 use revm::{
     context::block_states::PreBlockState,
     database::{states::cache::MyError, CacheState},
@@ -53,7 +61,15 @@ pub trait ProviderRW: Sync {
     fn last_finalized_block_number(&self) -> Option<BlockNumber>;
     /// Create a shared provider for one tx to avoid redudant heap allocation,
     ///  it's almost 50% faster than create a lastest provider for each read.
-    fn lastest_provider_ro(&self) -> LatestProvider;
+    fn lastest_provider_tx_ro(&self) -> LatestReadTxProvider;
+}
+
+///
+pub trait CursorReader<N: ProviderNodeTypes>: Send + Sync {
+    ///
+    fn lastest_provider_cur_ro(
+        &self,
+    ) -> LatestReadCursorProvider<<<N as NodeTypesWithDB>::DB as RethDatabase>::TX>;
 }
 
 ///
@@ -92,7 +108,13 @@ impl ProviderFactoryWrapper<EthereumNode> {
         let db_path = rootdir.join("db");
         let sf_path = rootdir.join("static_files");
 
-        let db = init_db(db_path.clone(), DatabaseArguments::default()).unwrap();
+        let db = init_db(
+            db_path.clone(),
+            // default max_reader is larger than this, so there is no need to set it.
+            // here max_reader is set just for experiment.
+            DatabaseArguments::default().with_max_readers(Some(10000)),
+        )
+        .unwrap();
         let db: Arc<DatabaseEnv> = Arc::new(db);
 
         let factory = ProviderFactory::new(
@@ -333,18 +355,39 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
         provider.last_finalized_block_number().ok().flatten()
     }
 
-    /// create a lastest provider for a batched blocks.
-    fn lastest_provider_ro(&self) -> LatestProvider {
+    /// create a lastest read tx provider for a batched blocks.
+    fn lastest_provider_tx_ro(&self) -> LatestReadTxProvider {
         // here the Boxed provider is returned. I've tried with non-boxed provider, but the perf diff is minimal.
-        LatestProvider(self.inner.latest().unwrap())
+        LatestReadTxProvider(self.inner.latest().unwrap())
+    }
+}
+
+impl<N: ProviderNodeTypes> CursorReader<N> for ProviderFactoryWrapper<N> {
+    /// create a lastest read cursor provider for a batched blocks.
+    fn lastest_provider_cur_ro(
+        &self,
+    ) -> LatestReadCursorProvider<<<N as NodeTypesWithDB>::DB as RethDatabase>::TX> {
+        // here the Boxed provider is returned. I've tried with non-boxed provider, but the perf diff is minimal.
+        let factory = self.inner.provider().unwrap();
+        let db_tx = factory.into_tx();
+        let cur_account = db_tx.cursor_read::<tables::PlainAccountState>().unwrap();
+        let cur_storage = db_tx
+            .cursor_dup_read::<tables::PlainStorageState>()
+            .unwrap();
+        let cur_code = db_tx.cursor_read::<tables::Bytecodes>().unwrap();
+        LatestReadCursorProvider {
+            cur_account: RefCell::new(cur_account),
+            cur_storage: RefCell::new(cur_storage),
+            cur_code: RefCell::new(cur_code),
+        }
     }
 }
 
 /// Wrapper for latest provider to minize Box allocation for each underlying latest provider.
 /// If without this, the performance will downgrade ~50%!.
-pub struct LatestProvider(Box<dyn StateProvider>);
+pub struct LatestReadTxProvider(Box<dyn StateProvider>);
 
-impl DatabaseRef for LatestProvider {
+impl DatabaseRef for LatestReadTxProvider {
     #[doc = " The database error type."]
     type Error = MyError;
 
@@ -400,6 +443,84 @@ impl DatabaseRef for LatestProvider {
         let val = provider.storage(address, index.into());
         match val {
             Ok(Some(val)) => Ok(val.into()),
+            Ok(None) => Ok(StorageValue::default()),
+            Err(_) => panic!("provider storage_ref error, addr:{address}, key:{index}"),
+        }
+    }
+
+    #[doc = " Gets block hash by block number."]
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        todo!()
+    }
+}
+
+///
+pub type CursorDupTy<TX, T> = <TX as DbTx>::DupCursor<T>;
+/// Wrapper for db cursor to avoid read tx when using LatestReadTxProvider.
+/// If without this, the performance will downgrade ~50%!.
+pub struct LatestReadCursorProvider<TX: DbTx> {
+    cur_account: RefCell<CursorTy<TX, tables::PlainAccountState>>,
+    cur_storage: RefCell<CursorDupTy<TX, tables::PlainStorageState>>,
+    cur_code: RefCell<CursorTy<TX, tables::Bytecodes>>,
+}
+
+impl<TX: DbTx> DatabaseRef for LatestReadCursorProvider<TX> {
+    #[doc = " The database error type."]
+    type Error = MyError;
+
+    #[doc = " Gets basic account information."]
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        let mut cur_account = self.cur_account.borrow_mut();
+        let acct = cur_account.seek_exact(address);
+        match acct {
+            Ok(Some((_, acct))) => {
+                // must get code along with basic account.
+                let code_hash = acct.get_bytecode_hash();
+                let code = if code_hash != KECCAK256_EMPTY {
+                    Some(self.code_by_hash_ref(code_hash).unwrap())
+                } else {
+                    None
+                };
+                let mut acct_info: AccountInfo = acct.into();
+                acct_info.code = code;
+                Ok(Some(acct_info))
+            }
+            Ok(None) => Ok(None),
+            Err(_) => panic!("provider basic_ref error,addr:{:?}", address),
+        }
+    }
+
+    #[doc = " Gets account code by its hash."]
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        let mut cur_code = self.cur_code.borrow_mut();
+        let code = cur_code.seek_exact(code_hash);
+        match code {
+            Ok(Some((_, code))) => Ok(code.into()),
+            Ok(None) => Err(MyError {
+                message: format!("code for codehash:{code_hash} not found"),
+            }),
+            // Ok(None) => Ok(Bytecode::new()),
+            Err(_) => panic!("provider code_by_hash_ref error,code_hash:{:?}", code_hash),
+        }
+    }
+
+    #[doc = " Gets storage value of address at index."]
+    fn storage_ref(
+        &self,
+        address: Address,
+        index: StorageKey,
+    ) -> Result<StorageValue, Self::Error> {
+        let mut cur_storage = self.cur_storage.borrow_mut();
+        let key = index.into();
+        let val = cur_storage.seek_by_key_subkey(address, key);
+        match val {
+            Ok(Some(entry)) => {
+                if entry.key == key {
+                    Ok(entry.value.into())
+                } else {
+                    Ok(StorageValue::default())
+                }
+            }
             Ok(None) => Ok(StorageValue::default()),
             Err(_) => panic!("provider storage_ref error, addr:{address}, key:{index}"),
         }
@@ -481,6 +602,29 @@ impl<N: ProviderNodeTypes> DatabaseRef for ProviderFactoryWrapper<N> {
     }
 }
 
+/// Empth Database provider for Either to use.
+#[derive(Debug)]
+pub struct DummyDBProvider;
+impl Database for DummyDBProvider {
+    type Error = MyError;
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        todo!()
+    }
+    fn storage(
+        &mut self,
+        address: Address,
+        index: StorageKey,
+    ) -> Result<StorageValue, Self::Error> {
+        todo!()
+    }
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        todo!()
+    }
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        todo!()
+    }
+}
+
 // impl<N: ProviderNodeTypes> Deref for ProviderFactoryWrapper<N> {
 //     type Target = ProviderFactory<N>;
 
@@ -492,6 +636,9 @@ impl<N: ProviderNodeTypes> DatabaseRef for ProviderFactoryWrapper<N> {
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{address, hex, keccak256, U256};
+    use rayon::iter::Either;
+    use rayon::prelude::*;
+    use rayon::{iter::IntoParallelIterator, ThreadPoolBuilder};
     use reth_primitives_traits::Account;
     use revm::{
         context::block_states::MyPlainAccount,
@@ -501,12 +648,13 @@ mod tests {
 
     use super::*;
     fn provider_with_db_type(mock: bool) {
-        let factory: Box<dyn ProviderRW> = if mock {
-            let p = ProviderFactoryWrapper::<EthereumNode>::new("./temp".into());
-            Box::new(p)
+        let factory = if mock {
+            let p: ProviderFactoryWrapper<EthereumNode> =
+                ProviderFactoryWrapper::<EthereumNode>::new("./temp".into());
+            Either::Left(p)
         } else {
             let p = ProviderFactoryWrapper::<MockNodeTypesWithDB>::new("./temp".into());
-            Box::new(p)
+            Either::Right(p)
         };
 
         // set some accounts
@@ -530,16 +678,40 @@ mod tests {
         storage.insert(key, value);
 
         // set initial state in db
-        factory.set_preblock_state(&prestate);
-        factory.set_storage(addr, storage);
+        match factory {
+            Either::Left(factory) => {
+                factory.set_preblock_state(&prestate);
+                factory.set_storage(addr, storage);
 
-        let provider = factory.lastest_provider_ro();
-        // fetch account
-        assert!(matches!(provider.basic_ref(addr), Ok(Some(acct_info)) if acct_info == acct));
-        // fetch storage
-        assert!(matches!(provider.storage_ref(addr, key), Ok(val_1) if val_1 == value));
-        // fetch code
-        assert!(matches!(provider.code_by_hash_ref(code_hash), Ok(code_1) if code_1 == code));
+                let provider = factory.lastest_provider_tx_ro();
+                // fetch account
+                assert!(
+                    matches!(provider.basic_ref(addr), Ok(Some(acct_info)) if acct_info == acct)
+                );
+                // fetch storage
+                assert!(matches!(provider.storage_ref(addr, key), Ok(val_1) if val_1 == value));
+                // fetch code
+                assert!(
+                    matches!(provider.code_by_hash_ref(code_hash), Ok(code_1) if code_1 == code)
+                );
+            }
+            Either::Right(factory) => {
+                factory.set_preblock_state(&prestate);
+                factory.set_storage(addr, storage);
+
+                let provider = factory.lastest_provider_tx_ro();
+                // fetch account
+                assert!(
+                    matches!(provider.basic_ref(addr), Ok(Some(acct_info)) if acct_info == acct)
+                );
+                // fetch storage
+                assert!(matches!(provider.storage_ref(addr, key), Ok(val_1) if val_1 == value));
+                // fetch code
+                assert!(
+                    matches!(provider.code_by_hash_ref(code_hash), Ok(code_1) if code_1 == code)
+                );
+            }
+        }
     }
 
     #[test]
@@ -569,7 +741,7 @@ mod tests {
         p.set_preblock_state(&c1);
 
         assert!(
-            matches!(p.lastest_provider_ro().storage_ref(addr2, slot_key), Ok(val) if val == slot_val)
+            matches!(p.lastest_provider_tx_ro().storage_ref(addr2, slot_key), Ok(val) if val == slot_val)
         );
 
         let factory = Some(p);
@@ -613,7 +785,7 @@ mod tests {
             // let p = provider.as_ref().unwrap();
             p.commit_bal_changes(&bal, 0);
 
-            let provider = p.lastest_provider_ro();
+            let provider = p.lastest_provider_tx_ro();
             // verify changes
             assert!(
                 matches!(provider.basic_ref(addr1), Ok(Some(acct_info)) if acct_info.nonce == 2 && acct_info.balance == U256::from(2000u64) && acct_info.code_hash == KECCAK_EMPTY)
@@ -655,7 +827,7 @@ mod tests {
         let addr = address!("0xdAC17F958D2ee523a2206206994597C13D831ec7");
         let addr = address!("0x70bC1e16513aD49Bd28c20b7b50679381a71ADF5");
 
-        let provider = factory.lastest_provider_ro();
+        let provider = factory.lastest_provider_tx_ro();
         // fetch account
         let acct = provider.basic_ref(addr).unwrap();
         println!("acct:{:?}", Account::from(acct.clone().unwrap()));
@@ -670,5 +842,20 @@ mod tests {
             assert_eq!(keccak256(code.original_bytes()), acct.code_hash);
             println!("code len:{}", code.len());
         }
+    }
+
+    #[test]
+    fn test_map_init() {
+        // simulate creating a cursor for each thread
+        let pool = ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        pool.install(|| {
+            (0..20).into_par_iter().for_each_init(
+                || vec![],
+                |init, x| {
+                    init.push(x);
+                    println!("{:?}", init);
+                },
+            )
+        });
     }
 }

@@ -5,12 +5,13 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use dashmap::{DashMap, Entry::Occupied, Entry::Vacant};
+use reth_db_api::Database as RethDatabase;
 use revm::context::block_states::PreBlockState;
 use revm::database::states::cache::MyError;
 use revm::primitives::StorageKey;
 use revm::state::AccountInfo;
-use revm::DatabaseRef;
 use revm::{bytecode::Bytecode, primitives::StorageValue};
+use revm::{Database, DatabaseRef};
 
 use alloy_primitives::{Address, B256};
 
@@ -70,26 +71,63 @@ impl Iterable for &VecDeque<PreBlockState> {
 /// Must creat a seperate provider for each evm-tx, because the underlying DB will treat all the read/write as a single db-tx.
 /// So if all evm-txs share the same provider, the db-tx is sequential!
 #[derive(Debug)]
-pub struct MTCache<DB, MEM>
-where
-    MEM: Iterable,
-{
+pub struct MTCache<DB, MEM, Shared = Arc<SharedCache>> {
     /// Underling database
     db: DB,
     /// Shared Cache
-    shared: Arc<SharedCache>,
+    shared: Shared,
     /// The performance diff with or without last 2 block's state changes is minimal.
     in_memory: Option<MEM>,
 }
 
-impl<DB, MEM> MTCache<DB, MEM>
-where
-    DB: DatabaseRef,
-    MEM: Iterable,
-{
+impl Default for MTCache<(), (), ()> {
+    fn default() -> MTCache<(), (), ()> {
+        MTCache {
+            db: (),
+            shared: (),
+            in_memory: Some(()),
+        }
+    }
+}
+
+impl<DB, MEM, Shared> MTCache<DB, MEM, Shared> {
     /// Create with a db
-    pub fn new(db: DB, shared: Arc<SharedCache>, in_memory: Option<MEM>) -> Self {
-        Self {
+    pub fn build_shared<MEMB: Iterable>(
+        self,
+        shared: Arc<SharedCache>,
+        in_memory: Option<MEMB>,
+    ) -> MTCache<DB, MEMB> {
+        let Self { db, .. } = self;
+        MTCache {
+            db,
+            shared,
+            in_memory,
+        }
+    }
+    ///
+    pub fn build_db_ref<DBRef: DatabaseRef>(self, db: DBRef) -> MTCache<DBRef, MEM, Shared> {
+        let Self {
+            db: _,
+            shared,
+            in_memory,
+        } = self;
+
+        MTCache {
+            db,
+            shared,
+            in_memory,
+        }
+    }
+
+    ///
+    pub fn build_db<RethDB: Database>(self, db: RethDB) -> MTCache<RethDB, MEM, Shared> {
+        let Self {
+            db: _,
+            shared,
+            in_memory,
+        } = self;
+
+        MTCache {
             db,
             shared,
             in_memory,
@@ -210,6 +248,111 @@ where
     }
 }
 
+impl<DB, MEM> Database for MTCache<DB, MEM>
+where
+    DB: Database<Error = MyError>,
+    MEM: Iterable,
+{
+    #[doc = " The database error type."]
+    type Error = MyError;
+
+    #[doc = " Gets basic account information."]
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        if let Some(mem) = &self.in_memory {
+            for state in mem.iter() {
+                if let Some(acct) = state.accounts.get(&address) {
+                    return Ok(acct.info.clone());
+                }
+            }
+        }
+        // fast path：lock-fress clone
+        if let Some(v) = self.shared.accounts.get(&address) {
+            return Ok(v.clone());
+        }
+
+        // slow path: lock-free db access
+        let acct = self.db.basic(address)?;
+
+        // short critical section
+        match self.shared.accounts.entry(address) {
+            Occupied(e) => Ok(e.get().clone()),
+            Vacant(e) => {
+                e.insert(acct.clone());
+                Ok(acct)
+            }
+        }
+    }
+
+    #[doc = " Gets account code by its hash."]
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        if let Some(mem) = &self.in_memory {
+            // not neccesary due to it's already returned by the basic_ref.
+        }
+
+        // Fast path
+        if let Some(code) = self.shared.contracts.get(&code_hash) {
+            return Ok(code.clone());
+        }
+
+        // slow path: lock-free db access
+        let code = self.db.code_by_hash(code_hash)?;
+
+        // short critical section
+        match self.shared.contracts.entry(code_hash) {
+            Occupied(e) => Ok(e.get().clone()),
+            Vacant(e) => {
+                e.insert(code.clone());
+                Ok(code)
+            }
+        }
+    }
+
+    #[doc = " Gets storage value of address at index."]
+    fn storage(
+        &mut self,
+        address: Address,
+        index: StorageKey,
+    ) -> Result<StorageValue, Self::Error> {
+        if let Some(mem) = &self.in_memory {
+            for state in mem.iter() {
+                if let Some(acct) = state.accounts.get(&address) {
+                    if let Some(val) = acct.storage.get(&index) {
+                        return Ok(val.clone());
+                    }
+                }
+            }
+        }
+        // Fast path: address + slot both cached
+        if let Some(inner) = self.shared.storage.get(&address) {
+            if let Some(val) = inner.get(&index) {
+                return Ok(*val);
+            }
+        }
+
+        // Slow path: lock-free db access
+        let val = self.db.storage(address, index)?;
+        // Ensure inner map exists, then insert value
+        let inner = self
+            .shared
+            .storage
+            .entry(address)
+            .or_insert_with(DashMap::default);
+        let res = match inner.entry(index) {
+            Occupied(e) => Ok(e.get().clone()),
+            Vacant(e) => {
+                e.insert(val);
+                Ok(val)
+            }
+        };
+        res
+    }
+
+    #[doc = " Gets block hash by block number."]
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        todo!()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,8 +401,9 @@ mod tests {
             result: res.clone(),
         };
 
-        let cache: MTCache<MockDB, &Vec<PreBlockState>> =
-            MTCache::new(db, Arc::new(SharedCache::new()), None);
+        let cache: MTCache<MockDB, &Vec<PreBlockState>> = MTCache::default()
+            .build_shared(Arc::new(SharedCache::new()), None)
+            .build_db_ref(db);
 
         let addr = Address::random();
 

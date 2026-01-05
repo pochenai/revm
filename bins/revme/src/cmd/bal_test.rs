@@ -10,10 +10,10 @@ use crossbeam::channel::unbounded;
 
 use alloy_primitives::{bytes, Bytes};
 use flatdb::{
-    MainnetProviderRW, MockProviderRW, ProviderRW, mtcache::{MTCache, SharedCache}, preblock_db_provider::PreBlockStateCache
+    CursorReader, DummyDBProvider, MainnetProviderRW, MockProviderRW, ProviderRW, mtcache::{MTCache, SharedCache}, preblock_db_provider::{BALRead, PreBlockStateCache}
 };
 use revm::{
-    Context, DatabaseRef, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext, context::{
+    Context, Database, DatabaseRef, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext, context::{
         BlockEnv, block_states::{
             PreBlockState, RecoveredBlockVec, RethBlock, envelope_to_txenv, import_struct, prestates_to_cachedbs, write_data
         }
@@ -104,7 +104,7 @@ pub struct Cmd {
     pre_recover_sender: bool,
     #[arg(long)]
     datadir: Option<String>,
-    #[arg(long, value_enum, default_value = "batched")]
+    #[arg(long, value_enum, default_value = "par")]
     io: IOPattern,
     #[arg(long, default_value_t = false)]
     recover_db: bool,
@@ -137,9 +137,9 @@ pub enum PriorityOrder {
 #[derive(Clone, Debug, ValueEnum, Default)]
 pub enum IOPattern {
     /// Parallel I/O with tx-parallelism.
+    #[default]
     #[clap(alias = "par")]
     Parallel,
-    #[default]
     #[clap(alias = "batched")]
     /// Batched prefetching I/O given bal read locations.
     Batched,
@@ -163,10 +163,10 @@ impl Deref for DBProvider {
 }
 
 impl DBProvider {
-    pub fn as_rw(&self) -> &dyn flatdb::ProviderRW {
+    pub fn as_rw(&self) -> Either<&MockProviderRW, &MainnetProviderRW> {
         match self {
-            DBProvider::MockDB(db) => db,
-            DBProvider::MainnetDB(db) => db,
+            DBProvider::MockDB(db) => Either::Left(db),
+            DBProvider::MainnetDB(db) => Either::Right(db),
         }
     }
 
@@ -251,7 +251,7 @@ impl Cmd {
         if self.recover_db {
             if let Some(provider_rw) = database_provider {
                 let all_pre_state = derive_pre_all_execution_state(&prestates);
-                provider_rw.as_rw().set_preblock_state(&all_pre_state);
+                provider_rw.set_preblock_state(&all_pre_state);
                 println!("state rewinds to block at {}", blocks[0].number-1);
             }
             return Ok(());
@@ -259,15 +259,16 @@ impl Cmd {
 
         let caches = prestates_to_cachedbs(prestates);
 
-        let prestates = caches_to_prestates(caches, &bals, &blocks, self.pre_tx_state);
-
-        let (gasused, batch_merged_bals) = if self.par {
+        let (gasused, batch_merged_bals, batch_merged_bal_reads) = if self.par {
             let gasused = import_struct(format!("./data/gasused_{nblocks}.json"));
             let batch_merged_bals = batch_merged_bal(&bals, &gasused, self);
-            (gasused, batch_merged_bals)
+            let batch_merged_bal_reads = batch_merged_bal_read(&caches, self);
+            (gasused, batch_merged_bals, batch_merged_bal_reads)
         } else {
-            (vec![], vec![])
+            (vec![], vec![],  vec![])
         };
+
+        let prestates = caches_to_prestates(caches, &bals, &blocks, self.pre_tx_state);
 
         println!("preloading kzg......");
         // preload kzg trusted setup
@@ -296,6 +297,7 @@ impl Cmd {
                         block_hashes,
                         gasused,
                         self,
+                        batch_merged_bal_reads
                     ),
                     _ => (
                         execute_blocks_par_scheduler(
@@ -318,9 +320,10 @@ impl Cmd {
         );
 
         println!(
-            "total gas used:{}M, gas per second:{:?} MGas/s",
+            "total gas used:{}M, gas per second:{:?} MGas/s, execution time without commit:{:?}",
             gas_used / 1_000_000,
-            gas_used / ((elapsed - commit_time).as_millis() as u64) / 1000
+            gas_used / ((elapsed - commit_time).as_millis() as u64) / 1000,
+            elapsed - commit_time,
         );
 
         Ok(())
@@ -340,6 +343,30 @@ fn batch_merged_bal(bals: &Vec<Bal>, txs_gas_used: &Vec<Vec<u64>>, cmd_env: &Cmd
             }
 
             res.push(bal);
+        },
+    );
+
+    res
+}
+
+fn batch_merged_bal_read(preblock_cache: &Vec<CacheState>, cmd_env: &Cmd) -> Vec<BALRead> {
+    let chunk_size = cmd_env.batch_blocks;
+    let mut res = vec![];
+    preblock_cache.chunks(chunk_size).for_each(
+        |chunked_preblock_cache| {
+            let mut bal_read = BALRead::default();
+            for cache in chunked_preblock_cache {
+                for (addr, acct) in &cache.accounts {
+                    let entry = bal_read.reads.entry(*addr).or_default();
+                    if let Some(info) = &acct.account {
+                        for (key, _) in &info.storage {
+                            entry.insert(*key);
+                        }
+                    }
+                }
+            }
+
+            res.push(bal_read);
         },
     );
 
@@ -685,6 +712,7 @@ fn handle_tx(
     // print!("exe_result:{:?}", exe_result)
 }
 
+
 static mut SCHEDULER_OVERHEAD: Duration = Duration::ZERO;
 static mut SCHEDULER_SENDER_OVERHEAD: Duration = Duration::ZERO;
 static mut EXECUTION: Duration = Duration::ZERO;
@@ -883,6 +911,7 @@ fn execute_blocks_par(
     block_hashes: BTreeMap<u64, B256>,
     txs_gas_used: Vec<Vec<u64>>,
     cmd_env: &Cmd,
+    batch_merged_bal_reads: Vec<BALRead>,
 ) -> (u64, Duration) {
     let debug = cmd_env.debug;
     let start_block = blocks[0].number;
@@ -890,6 +919,7 @@ fn execute_blocks_par(
     let batch = cmd_env.batch_blocks;
     let mut current_bn = blocks[0].number;
     let mut commit_time = Duration::ZERO;
+    let mut prefetch_time = Duration::ZERO;
 
     let mut in_mem = VecDeque::with_capacity(2);
 
@@ -913,10 +943,27 @@ fn execute_blocks_par(
                 // batched prefetching pre-block state
                 let provider = match cmd_env.io {
                     IOPattern::Batched => {
-                        let mut p = PreBlockStateCache::new(db.as_rw());
-                        p.batch_preblock_state(batch_merged_bal, cmd_env.threads * 2);
-                        println!("prefetched all state for blocks:[{}-{}]", start_block*(chunk_idx as u64), start_block*((chunk_idx as u64)+1));
-                        Some(p)
+                        let start = Instant::now();
+                        println!("---prefetching all state for blocks:[{}-{}]", start_block*(chunk_idx as u64), start_block*((chunk_idx as u64)+1));
+                        let bal_read = &batch_merged_bal_reads[chunk_idx];
+                        let p = match db {
+                            DBProvider::MockDB(factory) => {
+                                let mut p = PreBlockStateCache::new(factory);
+                                p.batch_preblock_state(bal_read, cmd_env.threads * 2);
+                                Some(Either::Left(p))
+                            } ,
+
+                            DBProvider::MainnetDB(factory) => {
+                                let mut p = PreBlockStateCache::new(factory);
+                                p.batch_preblock_state(bal_read, cmd_env.threads * 2);
+                               Some(Either::Right(p))
+                            },
+                        };
+                        
+                        println!("+++prefetched  all state for blocks:[{}-{}]", start_block*(chunk_idx as u64), start_block*((chunk_idx as u64)+1));
+                        prefetch_time += start.elapsed();
+                        p 
+
                     },
                     IOPattern::Parallel => None,
                 };
@@ -951,33 +998,55 @@ fn execute_blocks_par(
                     .transactions
                     .par_iter()
                     .enumerate()
-                    .map(|(tx_index, tx)| {
+                    .map_init(
+                        ||{
+                            match db_rw.as_ref() {
+                             Some(db) => {
+                                if preblock_fetcher.is_some() {
+                                    return None;
+                                }
+                                let mt_cache_cur_ro = db.as_rw().map_either(|l|{
+                                    MTCache::default()
+                                        .build_shared(Arc::clone(&shared_cache), Some(&in_mem))
+                                        .build_db_ref(l.lastest_provider_cur_ro())                                    
+                                }, |r|{
+                                    MTCache::default()
+                                        .build_shared(Arc::clone(&shared_cache), Some(&in_mem))
+                                        .build_db_ref(r.lastest_provider_cur_ro())   
+                                });
+                                Some(mt_cache_cur_ro)
+                             },
+                             None=> None,
+                            }
+                        },
+                        |mt_cache_cur_ro, (tx_index, tx)| {
                         if cmd_env.skip_7702 && tx.is_eip7702() {
                             return (tx_index as u64, 0, Duration::ZERO, tx, i, 0);
                         }
-                        let (prestate, bal) = match db_rw.as_ref() {
-                            Some(db) => {
-                                let prestate = match &preblock_fetcher {
-                                    Some(p) => Either::Left(Either::Left(p)),
-                                    None => {
-                                        // create a provider for each thread because read is a tx is rethdb.
-                                        let provider = db.as_rw().lastest_provider_ro();
-                                        let mt_cache = MTCache::new(provider, Arc::clone(&shared_cache), Some(&in_mem));
-                                        Either::Left(Either::Right(mt_cache))
-                                    }
-                                };
-                                (prestate, Some(bal_ref))
-                            }
-        
+                        let (prestate, bal) = match db_rw.as_ref() {        
                             None => {
                                 let block_idx = i + chunk_idx * batch;
                                 let cache = &prestates[block_idx];
                                 match cache {
-                                    Either::Left(cache) => (Either::Right(cache), Some(bal_ref)),
+                                    Either::Left(cache) => (Either::Left(cache), Some(bal_ref)),
                                     Either::Right(tx_caches) => {
-                                        (Either::Right(&tx_caches[tx_index]), None)
+                                        (Either::Left(&tx_caches[tx_index]), None)
                                     }
                                 }
+                            },
+                            Some(db) => {
+                                let prestate = match &preblock_fetcher {
+                                    Some(p) => Either::Right(Either::Left(p)),
+                                    None => {
+                                        // create a provider for each thread because read is a tx is rethdb.
+                                        // let provider = db.lastest_provider_tx_ro();
+                                        // let mt_cache = MTCache::default()
+                                        //     .build_shared(Arc::clone(&shared_cache), Some(&in_mem))
+                                        //     .build_db_ref(provider);
+                                        Either::Right(Either::Right(mt_cache_cur_ro.as_ref().unwrap()))
+                                    }
+                                };
+                                (prestate, Some(bal_ref))
                             }
                         };
 
@@ -1013,7 +1082,7 @@ fn execute_blocks_par(
         let commit_start = Instant::now();
         current_bn += chunk_blocks.len() as u64;
         if let Some(db) = db_rw.as_ref() {
-            let latest_state = db.as_rw().commit_bal_changes(batch_merged_bal, current_bn);
+            let latest_state = db.commit_bal_changes(batch_merged_bal, current_bn);
             // cache last 2 block's state changes
             if in_mem.len() >= 2 {
                 in_mem.pop_back();
@@ -1074,6 +1143,7 @@ fn execute_blocks_par(
     }
 
     println!("total commit time:{:?}", commit_time);
+    println!("total prefetch time:{:?}", prefetch_time);
     println!("execute_blocks_par complete!");
     (total_gas_used, commit_time)
 }

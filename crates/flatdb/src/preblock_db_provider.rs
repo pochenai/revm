@@ -1,5 +1,6 @@
 use rayon::ThreadPoolBuilder;
-use std::collections::HashMap;
+use reth_provider::providers::ProviderNodeTypes;
+use std::collections::{HashMap, HashSet};
 
 use alloy_primitives::{Address, B256};
 use rayon::prelude::*;
@@ -10,11 +11,18 @@ use revm::{
     DatabaseRef,
 };
 
-use crate::ProviderRW;
+use crate::{CursorReader, ProviderRW};
+use revm::Database;
 
 ///
-pub struct PreBlockStateCache<'a> {
-    db: &'a dyn ProviderRW,
+#[derive(Debug, Default)]
+pub struct BALRead {
+    pub reads: HashMap<Address, HashSet<StorageKey>>,
+}
+
+///
+pub struct PreBlockStateCache<'a, N: ProviderNodeTypes> {
+    db: &'a dyn CursorReader<N>,
     accounts: HashMap<Address, PlainAccount>,
     // storage: HashMap<Address, HashMap<StorageKey, StorageValue>>,
     // Created contracts
@@ -27,9 +35,9 @@ struct PlainAccount {
     storage: HashMap<StorageKey, StorageValue>,
 }
 
-impl<'a> PreBlockStateCache<'a> {
+impl<'a, N: ProviderNodeTypes> PreBlockStateCache<'a, N> {
     ///
-    pub fn new(db: &'a dyn ProviderRW) -> Self {
+    pub fn new(db: &'a dyn CursorReader<N>) -> Self {
         Self {
             db: db,
             accounts: HashMap::default(),
@@ -39,31 +47,43 @@ impl<'a> PreBlockStateCache<'a> {
     }
 
     /// TODO: reset rayon threads number
-    pub fn batch_preblock_state(&mut self, bal: &Bal, threads: usize) {
-        let addrs: Vec<Address> = bal.accounts.keys().copied().collect();
-
-        let pool = ThreadPoolBuilder::new().num_threads(5).build().unwrap();
+    pub fn batch_preblock_state(&mut self, bal_read: &BALRead, threads: usize) {
+        // seems libmdbx can only scale up to 16 cores
+        let pool = ThreadPoolBuilder::new().num_threads(16).build().unwrap();
 
         pool.install(|| {
             // lastest_provider_ro is a wrapper for LatestStateProvider
-            let accounts = addrs
+            let accounts = bal_read
+                .reads
                 .par_iter()
                 .map_init(
-                    || self.db.lastest_provider_ro(), // create a provider for each thread
-                    |provider_ro, address| {
+                    || self.db.lastest_provider_cur_ro(), // create a provider for each thread
+                    |provider_ro, (address, slots)| {
                         let info = provider_ro.basic_ref(*address).unwrap();
-                        let acct_bal = bal.accounts.get(address).unwrap();
 
-                        let storage = acct_bal
-                            .storage
-                            .storage
-                            .iter()
-                            .map(|(key, _)| {
-                                let k: StorageKey = (*key).into();
-                                let v = provider_ro.storage_ref(*address, k.into()).unwrap();
-                                (k, v)
-                            })
+                        let storage = slots
+                            .par_iter()
+                            .map_init(
+                                || self.db.lastest_provider_cur_ro(),
+                                |provider_ro, key| {
+                                    let k: StorageKey = (*key).into();
+                                    let v = provider_ro.storage_ref(*address, k.into()).unwrap();
+                                    (k, v)
+                                },
+                            )
                             .collect::<HashMap<_, _>>();
+
+                        // sort the key first with sequential reader: worse performance (only 50% of parallel reading).
+                        // let mut storage_keys: Vec<_> =
+                        //     acct_bal.storage.storage.keys().copied().collect();
+                        // storage_keys.sort_unstable_by(|a, b| b.cmp(a));
+                        // let mut storage = HashMap::with_capacity(storage_keys.len());
+
+                        // for key in storage_keys {
+                        //     let k: StorageKey = key.into();
+                        //     let v = provider_ro.storage_ref(*address, k.into()).unwrap();
+                        //     storage.insert(k, v);
+                        // }
 
                         (*address, PlainAccount { info, storage })
                     },
@@ -120,7 +140,7 @@ impl<'a> PreBlockStateCache<'a> {
     }
 }
 
-impl<'a> DatabaseRef for PreBlockStateCache<'a> {
+impl<'a, N: ProviderNodeTypes> DatabaseRef for PreBlockStateCache<'a, N> {
     #[doc = " The database error type."]
     type Error = MyError;
 
