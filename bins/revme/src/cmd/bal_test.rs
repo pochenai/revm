@@ -10,7 +10,7 @@ use crossbeam::channel::unbounded;
 
 use alloy_primitives::{bytes, Bytes};
 use flatdb::{
-    MainnetProviderRW, MockProviderRW, ProviderRW, mtcache::{MTCache, SharedCache}, preblock_db_provider::PreBlockStateCache
+    MainnetProviderRW, MockProviderRW, ProviderRW, mtcache::{MTCache, SharedCache}, preblock_db_provider::{BALRead, PreBlockStateCache}
 };
 use revm::{
     Context, DatabaseRef, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext, context::{
@@ -104,12 +104,14 @@ pub struct Cmd {
     pre_recover_sender: bool,
     #[arg(long)]
     datadir: Option<String>,
-    #[arg(long, value_enum, default_value = "batched")]
+    #[arg(long, value_enum, default_value = "par")]
     io: IOPattern,
     #[arg(long, default_value_t = false)]
     recover_db: bool,
     #[arg(long, default_value_t = false)]
     mock_db: bool,
+    #[arg(long, default_value_t = 16)]
+    io_threads: usize,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, Default)]
@@ -137,9 +139,9 @@ pub enum PriorityOrder {
 #[derive(Clone, Debug, ValueEnum, Default)]
 pub enum IOPattern {
     /// Parallel I/O with tx-parallelism.
+    #[default]
     #[clap(alias = "par")]
     Parallel,
-    #[default]
     #[clap(alias = "batched")]
     /// Batched prefetching I/O given bal read locations.
     Batched,
@@ -259,15 +261,17 @@ impl Cmd {
 
         let caches = prestates_to_cachedbs(prestates);
 
-        let prestates = caches_to_prestates(caches, &bals, &blocks, self.pre_tx_state);
 
-        let (gasused, batch_merged_bals) = if self.par {
+        let (gasused, batch_merged_bals, batch_merged_bal_reads) = if self.par {
             let gasused = import_struct(format!("./data/gasused_{nblocks}.json"));
             let batch_merged_bals = batch_merged_bal(&bals, &gasused, self);
-            (gasused, batch_merged_bals)
+            let batch_merged_bal_reads = batch_merged_bal_read(&caches, self);
+            (gasused, batch_merged_bals, batch_merged_bal_reads)
         } else {
-            (vec![], vec![])
+            (vec![], vec![], vec![])
         };
+
+        let prestates = caches_to_prestates(caches, &bals, &blocks, self.pre_tx_state);
 
         println!("preloading kzg......");
         // preload kzg trusted setup
@@ -296,6 +300,7 @@ impl Cmd {
                         block_hashes,
                         gasused,
                         self,
+                        batch_merged_bal_reads
                     ),
                     _ => (
                         execute_blocks_par_scheduler(
@@ -340,6 +345,30 @@ fn batch_merged_bal(bals: &Vec<Bal>, txs_gas_used: &Vec<Vec<u64>>, cmd_env: &Cmd
             }
 
             res.push(bal);
+        },
+    );
+
+    res
+}
+
+fn batch_merged_bal_read(preblock_cache: &Vec<CacheState>, cmd_env: &Cmd) -> Vec<BALRead> {
+    let chunk_size = cmd_env.batch_blocks;
+    let mut res = vec![];
+    preblock_cache.chunks(chunk_size).for_each(
+        |chunked_preblock_cache| {
+            let mut bal_read = BALRead::default();
+            for cache in chunked_preblock_cache {
+                for (addr, acct) in &cache.accounts {
+                    let entry = bal_read.reads.entry(*addr).or_default();
+                    if let Some(info) = &acct.account {
+                        for (key, _) in &info.storage {
+                            entry.insert(*key);
+                        }
+                    }
+                }
+            }
+
+            res.push(bal_read);
         },
     );
 
@@ -883,6 +912,7 @@ fn execute_blocks_par(
     block_hashes: BTreeMap<u64, B256>,
     txs_gas_used: Vec<Vec<u64>>,
     cmd_env: &Cmd,
+    batch_merged_bal_reads: Vec<BALRead>,
 ) -> (u64, Duration) {
     let debug = cmd_env.debug;
     let start_block = blocks[0].number;
@@ -890,6 +920,7 @@ fn execute_blocks_par(
     let batch = cmd_env.batch_blocks;
     let mut current_bn = blocks[0].number;
     let mut commit_time = Duration::ZERO;
+    let mut prefetch_time = Duration::ZERO;
 
     let mut in_mem = VecDeque::with_capacity(2);
 
@@ -913,9 +944,14 @@ fn execute_blocks_par(
                 // batched prefetching pre-block state
                 let provider = match cmd_env.io {
                     IOPattern::Batched => {
+                        let start = Instant::now();
+
                         let mut p = PreBlockStateCache::new(db.as_rw());
-                        p.batch_preblock_state(batch_merged_bal, cmd_env.threads * 2);
+                        let bal_read = &batch_merged_bal_reads[chunk_idx];
+                        p.batch_preblock_state(bal_read, cmd_env.io_threads);
                         println!("prefetched all state for blocks:[{}-{}]", start_block*(chunk_idx as u64), start_block*((chunk_idx as u64)+1));
+
+                        prefetch_time += start.elapsed();
                         Some(p)
                     },
                     IOPattern::Parallel => None,
@@ -1074,6 +1110,7 @@ fn execute_blocks_par(
     }
 
     println!("total commit time:{:?}", commit_time);
+    println!("total prefetch time:{:?}", prefetch_time);
     println!("execute_blocks_par complete!");
     (total_gas_used, commit_time)
 }

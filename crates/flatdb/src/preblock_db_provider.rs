@@ -1,5 +1,5 @@
 use rayon::ThreadPoolBuilder;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use alloy_primitives::{Address, B256};
 use rayon::prelude::*;
@@ -27,6 +27,13 @@ struct PlainAccount {
     storage: HashMap<StorageKey, StorageValue>,
 }
 
+///
+#[derive(Debug, Default)]
+pub struct BALRead {
+    ///
+    pub reads: HashMap<Address, HashSet<StorageKey>>,
+}
+
 impl<'a> PreBlockStateCache<'a> {
     ///
     pub fn new(db: &'a dyn ProviderRW) -> Self {
@@ -39,30 +46,31 @@ impl<'a> PreBlockStateCache<'a> {
     }
 
     /// TODO: reset rayon threads number
-    pub fn batch_preblock_state(&mut self, bal: &Bal, threads: usize) {
-        let addrs: Vec<Address> = bal.accounts.keys().copied().collect();
-
-        let pool = ThreadPoolBuilder::new().num_threads(5).build().unwrap();
+    pub fn batch_preblock_state(&mut self, bal_read: &BALRead, threads: usize) {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
 
         pool.install(|| {
             // lastest_provider_ro is a wrapper for LatestStateProvider
-            let accounts = addrs
+            let accounts = bal_read
+                .reads
                 .par_iter()
                 .map_init(
                     || self.db.lastest_provider_ro(), // create a provider for each thread
-                    |provider_ro, address| {
+                    |provider_ro, (address, slots)| {
                         let info = provider_ro.basic_ref(*address).unwrap();
-                        let acct_bal = bal.accounts.get(address).unwrap();
-
-                        let storage = acct_bal
-                            .storage
-                            .storage
-                            .iter()
-                            .map(|(key, _)| {
-                                let k: StorageKey = (*key).into();
-                                let v = provider_ro.storage_ref(*address, k.into()).unwrap();
-                                (k, v)
-                            })
+                        let storage = slots
+                            .par_iter()
+                            .map_init(
+                                || self.db.lastest_provider_ro(),
+                                |provider_ro, key| {
+                                    let k: StorageKey = (*key).into();
+                                    let v = provider_ro.storage_ref(*address, k.into()).unwrap();
+                                    (k, v)
+                                },
+                            )
                             .collect::<HashMap<_, _>>();
 
                         (*address, PlainAccount { info, storage })
