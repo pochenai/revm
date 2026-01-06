@@ -10,7 +10,11 @@ use state::{
     bal::{Bal, BalError},
     AccountInfo, Bytecode, EvmState, RethAccount,
 };
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    default,
+    sync::Arc,
+};
 
 use crate::{DBErrorMarker, Database, DatabaseCommit};
 
@@ -131,6 +135,14 @@ macro_rules! dprintln {
     };
 }
 
+/// control whether dump db. Only set it to true in sequential mode!
+pub static mut DUMP_BAL_READ: bool = false;
+///
+pub type BalReadsTy = HashMap<Address, HashSet<StorageKey>>;
+/// hashmap for dumping BAL read. Only change it in sequential mode!
+pub static mut BAL_READS: std::sync::LazyLock<BalReadsTy> =
+    std::sync::LazyLock::new(|| BalReadsTy::default());
+
 impl<'a, DB: Database> Database for BalDatabase<'a, DB> {
     type Error = BalDatabaseError<DB::Error>;
 
@@ -147,6 +159,13 @@ impl<'a, DB: Database> Database for BalDatabase<'a, DB> {
                 .as_ref()
                 .map_or(0, |c| c.len())
         );
+
+        unsafe {
+            if DUMP_BAL_READ {
+                BAL_READS.entry(address).or_default();
+            }
+        }
+
         if let Some(bal) = &self.bal {
             let is_none = basic.is_none();
             let mut bal_basic = basic.unwrap_or_default();
@@ -186,6 +205,12 @@ impl<'a, DB: Database> Database for BalDatabase<'a, DB> {
             .storage(address, key)
             .map_err(BalDatabaseError::Database)?;
         dprintln!("db store, addr:{}, key:{}, value:{:?}", address, key, value);
+        unsafe {
+            if DUMP_BAL_READ {
+                let entry = BAL_READS.entry(address).or_default();
+                entry.insert(key);
+            }
+        }
         if let Some(bal) = &self.bal {
             bal.populate_storage_slot(address, self.bal_index, key, &mut value)
                 .map_err(BalDatabaseError::Bal)?;

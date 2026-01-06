@@ -10,7 +10,7 @@ use crossbeam::channel::unbounded;
 
 use alloy_primitives::{bytes, Bytes};
 use flatdb::{
-    MainnetProviderRW, MockProviderRW, ProviderRW, mtcache::{MTCache, SharedCache}, preblock_db_provider::{BALRead, PreBlockStateCache}
+    MainnetProviderRW, MockProviderRW, ProviderRW, mtcache::{MTCache, SharedCache}, preblock_db_provider::{PreBlockStateCache}
 };
 use revm::{
     Context, DatabaseRef, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext, context::{
@@ -18,7 +18,7 @@ use revm::{
             PreBlockState, RecoveredBlockVec, RethBlock, envelope_to_txenv, import_struct, prestates_to_cachedbs, write_data
         }
     }, context_interface::block::{self, BlobExcessGasAndPrice}, database::{
-        self, CacheState, PlainAccount, State, bal::{BalDatabase, DEBUG}, states::{CacheAccount, cache::MyError}
+        self, CacheState, PlainAccount, State, bal::{BAL_READS, BalDatabase, BalReadsTy, DEBUG, DUMP_BAL_READ}, states::{CacheAccount, cache::MyError}
     }, precompile::{bn254::pair, kzg_point_evaluation::init_load_kzg_trusted_setup}, primitives::{Address, B256, KECCAK_EMPTY, U256, address, alloy_primitives, hardfork::SpecId}, state::bal::Bal
 };
 
@@ -261,11 +261,11 @@ impl Cmd {
 
         let caches = prestates_to_cachedbs(prestates);
 
-
         let (gasused, batch_merged_bals, batch_merged_bal_reads) = if self.par {
             let gasused = import_struct(format!("./data/gasused_{nblocks}.json"));
             let batch_merged_bals = batch_merged_bal(&bals, &gasused, self);
-            let batch_merged_bal_reads = batch_merged_bal_read(&caches, self);
+            let bal_reads = import_struct(format!("./data/balread_{nblocks}.json"));
+            let batch_merged_bal_reads = batch_merged_bal_read(&bal_reads, self);
             (gasused, batch_merged_bals, batch_merged_bal_reads)
         } else {
             (vec![], vec![], vec![])
@@ -352,19 +352,17 @@ fn batch_merged_bal(bals: &Vec<Bal>, txs_gas_used: &Vec<Vec<u64>>, cmd_env: &Cmd
     res
 }
 
-fn batch_merged_bal_read(preblock_cache: &Vec<CacheState>, cmd_env: &Cmd) -> Vec<BALRead> {
+fn batch_merged_bal_read(preblock_cache: &Vec<BalReadsTy>, cmd_env: &Cmd) -> Vec<BalReadsTy> {
     let chunk_size = cmd_env.batch_blocks;
     let mut res = vec![];
     preblock_cache.chunks(chunk_size).for_each(
         |chunked_preblock_cache| {
-            let mut bal_read = BALRead::default();
+            let mut bal_read = BalReadsTy::default();
             for cache in chunked_preblock_cache {
-                for (addr, acct) in &cache.accounts {
-                    let entry = bal_read.reads.entry(*addr).or_default();
-                    if let Some(info) = &acct.account {
-                        for (key, _) in &info.storage {
-                            entry.insert(*key);
-                        }
+                for (addr, keys) in cache {
+                    let entry = bal_read.entry(*addr).or_default();
+                    for key in keys {
+                        entry.insert(*key);
                     }
                 }
             }
@@ -506,6 +504,8 @@ fn execute_blocks(
     cmd_env: &Cmd,
 ) -> u64 {
     let mut blocks_gas_used = vec![];
+    let mut bal_reads = vec![];
+    unsafe { DUMP_BAL_READ = true };
     let block_hashes = Arc::new(block_hashes);
 
     let mut total_clone_time = Duration::ZERO;
@@ -640,6 +640,10 @@ fn execute_blocks(
             // write gas used
             blocks_gas_used.push(block_gas_used);
         }
+        unsafe {
+            bal_reads.push(BAL_READS.clone());
+            BAL_READS = std::sync::LazyLock::new(|| BalReadsTy::default());
+        }
         println!("block execution:{} done", bn);
     }
     println!("total clone time:{:?}", total_clone_time);
@@ -647,6 +651,11 @@ fn execute_blocks(
     write_data(
         format!("gasused_{}.json", cmd_env.nblocks).as_str(),
         &blocks_gas_used,
+    );
+    println!("write block bal reads!");
+    write_data(
+        format!("balread_{}.json", cmd_env.nblocks).as_str(),
+        &bal_reads,
     );
     total_gas_used
 }
@@ -913,7 +922,7 @@ fn execute_blocks_par(
     block_hashes: BTreeMap<u64, B256>,
     txs_gas_used: Vec<Vec<u64>>,
     cmd_env: &Cmd,
-    batch_merged_bal_reads: Vec<BALRead>,
+    batch_merged_bal_reads: Vec<BalReadsTy>,
 ) -> (u64, Duration) {
     let debug = cmd_env.debug;
     let start_block = blocks[0].number;

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use alloy_primitives::{Address, B256};
 use rayon::prelude::*;
 use revm::{
-    database::states::cache::MyError,
+    database::{bal::BalReadsTy, states::cache::MyError},
     primitives::{StorageKey, StorageValue},
     state::{bal::Bal, AccountInfo, Bytecode},
     DatabaseRef,
@@ -27,13 +27,6 @@ struct PlainAccount {
     storage: HashMap<StorageKey, StorageValue>,
 }
 
-///
-#[derive(Debug, Default)]
-pub struct BALRead {
-    ///
-    pub reads: HashMap<Address, HashSet<StorageKey>>,
-}
-
 impl<'a> PreBlockStateCache<'a> {
     ///
     pub fn new(db: &'a dyn ProviderRW) -> Self {
@@ -46,7 +39,7 @@ impl<'a> PreBlockStateCache<'a> {
     }
 
     /// TODO: reset rayon threads number
-    pub fn batch_preblock_state(&mut self, bal_read: &BALRead, threads: usize) {
+    pub fn batch_preblock_state(&mut self, bal_read: &BalReadsTy, threads: usize) {
         let pool = ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
@@ -55,7 +48,6 @@ impl<'a> PreBlockStateCache<'a> {
         pool.install(|| {
             // lastest_provider_ro is a wrapper for LatestStateProvider
             let accounts = bal_read
-                .reads
                 .par_iter()
                 .map_init(
                     || self.db.lastest_provider_ro(), // create a provider for each thread
