@@ -2,6 +2,7 @@
 members = [
     # binary
     "bins/revme",
+    "bins/dbtool",
 
     # libraries
     "crates/revm",
@@ -36,7 +37,7 @@ members = [
     "examples/custom_opcodes",
     "examples/custom_precompile_journal",
     "crates/flatdb",
-    "crates/librocksdb",
+    "crates/librocksdb", 
 ]
 resolver = "2"
 default-members = ["crates/revm"]
