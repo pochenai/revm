@@ -319,11 +319,11 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
         }
 
         db_tx.commit().unwrap();
-        self.inner
-            .provider_rw()
-            .unwrap()
-            .save_finalized_block_number(finalized_bn)
-            .unwrap();
+        // self.inner
+        //     .provider_rw()
+        //     .unwrap()
+        //     .save_finalized_block_number(finalized_bn)
+        //     .unwrap();
 
         latest_state
     }

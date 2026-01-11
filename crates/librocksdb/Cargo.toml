@@ -1,0 +1,36 @@
+[package]
+name = "librocksdb"
+version = "0.1.0"
+license.workspace = true
+authors.workspace = true
+categories.workspace = true
+keywords.workspace = true
+repository.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# ethrex related
+thiserror.workspace = true
+ethrex_storage = { git = "https://github.com/lambdaclass/ethrex.git", package = "ethrex-storage", features = [
+    "rocksdb",
+] }
+tempfile = "3"
+
+# reth related
+alloy-primitives.workspace = true
+reth_primitives_traits.workspace = true
+reth_storage_api = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-storage-api" }
+reth_db_api = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-db-api" }
+reth_db = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-db" }
+
+# revm related
+revm = { workspace = true, features = [
+    "std",
+    "c-kzg",
+    "blst",
+    "tracer",
+    "parse",
+] }
