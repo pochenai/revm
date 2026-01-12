@@ -1934,7 +1934,13 @@ dependencies = [
 name = "dbtool"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "clap",
+ "flatdb",
+ "librocksdb",
+ "reth-db-api",
+ "reth-primitives-traits",
+ "tempfile",
 ]
 
 [[package]]

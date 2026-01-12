@@ -16,7 +16,7 @@ impl MainCmd {
     ///
     pub fn run(&self) {
         match self {
-            Self::Migration(cmd) => cmd.run(),
+            Self::Migration(cmd) => cmd.run::<false>(),
         }
     }
 }

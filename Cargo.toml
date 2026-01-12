@@ -37,7 +37,7 @@ members = [
     "examples/custom_opcodes",
     "examples/custom_precompile_journal",
     "crates/flatdb",
-    "crates/librocksdb", 
+    "crates/librocksdb",
 ]
 resolver = "2"
 default-members = ["crates/revm"]
@@ -60,6 +60,7 @@ handler = { path = "crates/handler", package = "revm-handler", version = "11.2.0
 op-revm = { path = "crates/op-revm", package = "op-revm", version = "11.2.0", default-features = false }
 ee-tests = { path = "crates/ee-tests", package = "revm-ee-tests", version = "0.1.0", default-features = false }
 flatdb = { path = "crates/flatdb", package = "flatdb" }
+librocksdb = { path = "crates/librocksdb", package = "librocksdb" }
 
 # alloy
 alloy-eip2930 = { version = "0.2.1", default-features = false }
@@ -137,6 +138,7 @@ serde_derive = "1.0"
 thiserror = "2.0"
 triehash = "0.8"
 walkdir = "2.5"
+tempfile = "3"
 
 # database
 reth_primitives_traits = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-primitives-traits", features = [

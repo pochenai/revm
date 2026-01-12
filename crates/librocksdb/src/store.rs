@@ -1,10 +1,13 @@
 use alloy_primitives::{Address, StorageKey, StorageValue, B256};
-use ethrex_storage::api::tables::{ACCOUNT_CODES, ACCOUNT_FLATKEYVALUE, STORAGE_FLATKEYVALUE};
+pub use ethrex_storage::api::tables::{ACCOUNT_CODES, ACCOUNT_FLATKEYVALUE, STORAGE_FLATKEYVALUE};
+use ethrex_storage::api::PrefixResult;
+use ethrex_storage::backend::rocksdb::RocksDBBackend;
 use ethrex_storage::{api::StorageBackend, error::StoreError};
 use reth_db::models::CompactU256;
 use reth_db_api::table::{Compress, Decode, Decompress, Encode};
 use reth_primitives_traits::{Account, Bytecode};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::compress_to_buf_or_ref;
@@ -13,7 +16,7 @@ const ADDR_SLOT_SPERATOR: u8 = 17;
 
 /// Database error type.
 #[derive(Debug, thiserror::Error)]
-pub enum DatabaseError {
+pub enum RocksDBError {
     /// Failed to open the database.
     #[error("failed to read the database: {_0}")]
     ReadError(#[from] StoreError),
@@ -34,7 +37,31 @@ impl Store {
         }
     }
 
-    pub fn basic_account(&self, address: Address) -> Result<Option<Account>, DatabaseError> {
+    pub fn new_rocksdb_backend(path: impl AsRef<Path>) -> Self {
+        let backend = RocksDBBackend::open(path).unwrap();
+        Self::new(backend)
+    }
+
+    pub fn print_all<K: Decompress, V: Decompress>(
+        &self,
+        table: &'static str,
+        prefix: &[u8],
+    ) -> Result<(), RocksDBError> {
+        let tx_read = self.backend.begin_read().unwrap();
+        let res = tx_read.prefix_iterator(table, prefix)?;
+
+        for item in res {
+            if let Ok((k, v)) = item {
+                let decoded_key: K = Decompress::decompress(&k)?;
+                let decoded_val: V = Decompress::decompress(&v)?;
+                println!("k:{:?}, v:{:?}", decoded_key, decoded_val);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn basic_account(&self, address: Address) -> Result<Option<Account>, RocksDBError> {
         let tx_read = self.backend.begin_read().unwrap();
         let encoded_key = address.encode();
         let v = tx_read.get(ACCOUNT_FLATKEYVALUE, &encoded_key)?;
@@ -47,7 +74,7 @@ impl Store {
         }
     }
 
-    pub fn bytecode_by_hash(&self, code_hash: B256) -> Result<Option<Bytecode>, DatabaseError> {
+    pub fn bytecode_by_hash(&self, code_hash: B256) -> Result<Option<Bytecode>, RocksDBError> {
         let tx_read = self.backend.begin_read().unwrap();
         let encoded_key = code_hash.encode();
         let v = tx_read.get(ACCOUNT_CODES, &encoded_key)?;
@@ -64,7 +91,7 @@ impl Store {
         &self,
         address: Address,
         key: StorageKey,
-    ) -> Result<Option<StorageValue>, DatabaseError> {
+    ) -> Result<Option<StorageValue>, RocksDBError> {
         let tx_read = self.backend.begin_read().unwrap();
         let encoded_addr = address.encode();
         let encoded_slot = key.encode();
@@ -81,68 +108,72 @@ impl Store {
         }
     }
 
-    pub fn set_accounts(&self, accounts: HashMap<Address, Account>) -> Result<(), DatabaseError> {
-        let batched_items = accounts
+    fn set_kvs<K: Encode, V: Compress>(
+        &self,
+        table: &'static str,
+        items: HashMap<K, V>,
+    ) -> Result<(), RocksDBError> {
+        let batched_items = items
             .into_iter()
             .map(|(addr, acct)| {
                 let key = addr.encode().into();
-                let mut value = Vec::with_capacity(72);
+                let mut value = vec![];
                 compress_to_buf_or_ref!(value, acct);
                 (key, value)
             })
             .collect::<Vec<_>>();
 
         let mut txn = self.backend.begin_write()?;
-        txn.put_batch(ACCOUNT_FLATKEYVALUE, batched_items)?;
+        txn.put_batch(table, batched_items)?;
         Ok(txn.commit()?)
     }
 
-    pub fn set_codes(&self, codes: HashMap<B256, Bytecode>) -> Result<(), DatabaseError> {
-        let batched_items = codes
+    pub fn set_accounts<K: Encode, V: Compress>(
+        &self,
+        accounts: HashMap<K, V>,
+    ) -> Result<(), RocksDBError> {
+        self.set_kvs(ACCOUNT_FLATKEYVALUE, accounts)
+    }
+
+    pub fn set_codes<K: Encode, V: Compress>(
+        &self,
+        codes: HashMap<K, V>,
+    ) -> Result<(), RocksDBError> {
+        self.set_kvs(ACCOUNT_CODES, codes)
+    }
+
+    fn set_dup_kvs<K: Encode, SK: Encode, V: Compress>(
+        &self,
+        table: &'static str,
+        items: Vec<(K, SK, V)>,
+    ) -> Result<(), RocksDBError> {
+        let batched_items = items
             .into_iter()
-            .map(|(hash, code)| {
-                let key = hash.encode().into();
-                let mut value = vec![];
-                compress_to_buf_or_ref!(value, code);
+            .map(|(key, slot, val)| {
+                let encoded_addr = key.encode();
+                let encoded_slot = slot.encode();
+                let key = addr_slot_key(encoded_addr.as_ref(), encoded_slot.as_ref());
+                let mut value = Vec::with_capacity(32);
+                compress_to_buf_or_ref!(value, val);
                 (key, value)
             })
             .collect::<Vec<_>>();
 
         let mut txn = self.backend.begin_write()?;
-        txn.put_batch(ACCOUNT_CODES, batched_items)?;
+        txn.put_batch(table, batched_items)?;
         Ok(txn.commit()?)
     }
 
-    pub fn set_storages(
+    pub fn set_storages<K: Encode, SK: Encode, V: Compress>(
         &self,
-        storages: HashMap<Address, HashMap<B256, StorageValue>>,
-    ) -> Result<(), DatabaseError> {
-        let batched_items = storages
-            .into_iter()
-            .flat_map(|(addr, storage)| {
-                let encoded_addr = addr.encode();
-
-                let mut kvs = Vec::with_capacity(storage.len());
-                for (slot, val) in storage {
-                    let encoded_slot = slot.encode();
-                    let key = addr_slot_key(&encoded_addr[..], &encoded_slot[..]);
-                    let mut value = Vec::with_capacity(32);
-                    let val: CompactU256 = val.into();
-                    compress_to_buf_or_ref!(value, val);
-                    kvs.push((key, value));
-                }
-                kvs
-            })
-            .collect::<Vec<_>>();
-
-        let mut txn = self.backend.begin_write()?;
-        txn.put_batch(STORAGE_FLATKEYVALUE, batched_items)?;
-        Ok(txn.commit()?)
+        storages: Vec<(K, SK, V)>,
+    ) -> Result<(), RocksDBError> {
+        self.set_dup_kvs(STORAGE_FLATKEYVALUE, storages)
     }
 }
 
 #[inline]
-fn addr_slot_key(encoded_addr: &[u8], encoded_slot: &[u8]) -> Vec<u8> {
+pub(crate) fn addr_slot_key(encoded_addr: &[u8], encoded_slot: &[u8]) -> Vec<u8> {
     [encoded_addr, &[ADDR_SLOT_SPERATOR], encoded_slot].concat()
 }
 
@@ -217,33 +248,32 @@ mod tests {
         assert!(matches!(acct, Ok(None)));
 
         // insert some storages
-        let mut storages = HashMap::new();
+        let mut storages = vec![];
         let addr1 = address!("0x1000000000000000000000000000000000000000");
-        let mut storage = HashMap::new();
         let slot1: StorageKey = U256::from(1).into();
         let val1 = StorageValue::from(1);
-        storage.insert(slot1, val1);
+        let val1: CompactU256 = val1.into();
+        storages.push((addr1, slot1, val1.clone()));
+
         let slot2 = U256::from(2).into();
         let val2 = StorageValue::from(2);
-        storage.insert(slot2, val2);
-
-        storages.insert(addr1, storage);
+        let val2: CompactU256 = val2.into();
+        storages.push((addr1, slot2, val2.clone()));
 
         let addr2 = address!("0x1000000000000000000000000000000000000001");
-        let mut storage = HashMap::new();
         let slot3 = U256::from(3).into();
         let val3 = StorageValue::from(3);
-        storage.insert(slot3, val3);
-        storages.insert(addr2, storage);
+        let val3: CompactU256 = val3.into();
+        storages.push((addr2, slot3, val3.clone()));
 
         store.set_storages(storages).unwrap();
 
         // get updated storage
-        assert!(matches!(store.storage(addr1, slot1), Ok(Some(val)) if val == val1));
-        assert!(matches!(store.storage(addr1, slot2), Ok(Some(val)) if val == val2));
+        assert!(matches!(store.storage(addr1, slot1), Ok(Some(val)) if val1 == val.into()));
+        assert!(matches!(store.storage(addr1, slot2), Ok(Some(val)) if val2 == val.into()));
         assert!(matches!(store.storage(addr2, slot1), Ok(None)));
         assert!(matches!(store.storage(addr2, slot2), Ok(None)));
-        assert!(matches!(store.storage(addr2, slot3), Ok(Some(val)) if val == val3));
+        assert!(matches!(store.storage(addr2, slot3), Ok(Some(val)) if val3 == val.into()));
     }
 
     fn setup_backend() -> RocksDBBackend {

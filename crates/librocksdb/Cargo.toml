@@ -17,7 +17,7 @@ thiserror.workspace = true
 ethrex_storage = { git = "https://github.com/lambdaclass/ethrex.git", package = "ethrex-storage", features = [
     "rocksdb",
 ] }
-tempfile = "3"
+
 
 # reth related
 alloy-primitives.workspace = true
@@ -34,3 +34,7 @@ revm = { workspace = true, features = [
     "tracer",
     "parse",
 ] }
+
+
+[dev-dependencies]
+tempfile.workspace = true

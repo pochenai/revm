@@ -61,7 +61,7 @@ pub type MainnetProviderRW = ProviderFactoryWrapper<EthereumNode>;
 ///
 pub type MockProviderRW = ProviderFactoryWrapper<MockNodeTypesWithDB>;
 ///
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProviderFactoryWrapper<N: ProviderNodeTypes> {
     inner: ProviderFactory<N>,
 }
@@ -103,6 +103,13 @@ impl ProviderFactoryWrapper<EthereumNode> {
         .unwrap();
 
         ProviderFactoryWrapper { inner: factory }
+    }
+
+    /// inner provider
+    pub fn provider_ro(
+        &self,
+    ) -> DatabaseProvider<reth_db::mdbx::tx::Tx<reth_db::mdbx::RO>, EthereumNode> {
+        self.inner.provider().unwrap()
     }
 }
 
