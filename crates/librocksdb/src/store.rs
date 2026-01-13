@@ -1,11 +1,14 @@
 use alloy_primitives::{Address, StorageKey, StorageValue, B256};
 pub use ethrex_storage::api::tables::{ACCOUNT_CODES, ACCOUNT_FLATKEYVALUE, STORAGE_FLATKEYVALUE};
-use ethrex_storage::api::PrefixResult;
+use ethrex_storage::api::{PrefixResult, StorageReadView};
 use ethrex_storage::backend::rocksdb::RocksDBBackend;
 use ethrex_storage::{api::StorageBackend, error::StoreError};
+use flatdb::ProviderRW;
 use reth_db::models::CompactU256;
 use reth_db_api::table::{Compress, Decode, Decompress, Encode};
 use reth_primitives_traits::{Account, Bytecode};
+use revm::database::states::cache::MyError;
+use revm::DatabaseRef;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -18,17 +21,20 @@ const ADDR_SLOT_SPERATOR: u8 = 17;
 #[derive(Debug, thiserror::Error)]
 pub enum RocksDBError {
     /// Failed to open the database.
-    #[error("failed to read the database: {_0}")]
+    #[error("[rocksdb] failed to read the database: {_0}")]
     ReadError(#[from] StoreError),
-    #[error("failed to decode value:{_0}")]
+    #[error("[rocksdb] failed to decode value:{_0}")]
     DecodeError(#[from] reth_db::DatabaseError),
-    #[error("{_0}")]
+    #[error("[rocksdb] {_0}")]
     Other(String),
 }
 
 pub struct Store {
     backend: Arc<dyn StorageBackend>,
 }
+
+// no need to impl this, as ProviderRW require sync.
+// unsafe impl Sync for Store {}
 
 impl Store {
     pub fn new(backend: impl StorageBackend + 'static) -> Self {
@@ -175,6 +181,119 @@ impl Store {
 #[inline]
 pub(crate) fn addr_slot_key(encoded_addr: &[u8], encoded_slot: &[u8]) -> Vec<u8> {
     [encoded_addr, &[ADDR_SLOT_SPERATOR], encoded_slot].concat()
+}
+
+impl From<RocksDBError> for MyError {
+    fn from(value: RocksDBError) -> Self {
+        MyError {
+            message: value.to_string(),
+        }
+    }
+}
+
+pub struct RocksDbProvider<'a>(Box<dyn StorageReadView + 'a>);
+
+impl<'a> DatabaseRef for RocksDbProvider<'a> {
+    type Error = MyError;
+    fn basic_ref(&self, address: Address) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
+        println!("basic_ref...");
+        let tx_read = &self.0;
+        let encoded_key = address.encode();
+        let v = tx_read
+            .get(ACCOUNT_FLATKEYVALUE, &encoded_key)
+            .map_err(|e| MyError::from(RocksDBError::from(e)))?;
+        match v {
+            Some(v) => {
+                let decoded: Account =
+                    Decompress::decompress(&v).map_err(|e| MyError::from(RocksDBError::from(e)))?;
+                Ok(Some(decoded.into()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
+        println!("code_by_hash_ref...");
+        let tx_read = &self.0;
+        let encoded_key = code_hash.encode();
+        let v = tx_read
+            .get(ACCOUNT_CODES, &encoded_key)
+            .map_err(|e| MyError::from(RocksDBError::from(e)))?;
+        match v {
+            Some(v) => {
+                let decoded: Bytecode =
+                    Decompress::decompress(&v).map_err(|e| MyError::from(RocksDBError::from(e)))?;
+                Ok(decoded.into())
+            }
+            None => Err(MyError {
+                message: format!("[rocksdb] code for codehash:{code_hash} not found"),
+            }),
+        }
+    }
+
+    fn storage_ref(
+        &self,
+        address: Address,
+        index: revm::primitives::StorageKey,
+    ) -> Result<revm::primitives::StorageValue, Self::Error> {
+        println!("storage ref...");
+        let tx_read = &self.0;
+        let encoded_addr = address.encode();
+        let slot: StorageKey = index.into();
+        let encoded_slot = slot.encode();
+        // Apply a prefix with an invalid nibble (17) as a separator
+        let encoded_key = addr_slot_key(&encoded_addr[..], &encoded_slot[..]);
+        let v = tx_read
+            .get(STORAGE_FLATKEYVALUE, &encoded_key)
+            .map_err(|e| MyError::from(RocksDBError::from(e)))?;
+        match v {
+            Some(v) => {
+                let decoded: CompactU256 =
+                    Decompress::decompress(&v).map_err(|e| MyError::from(RocksDBError::from(e)))?;
+                let decoded = decoded.into();
+                Ok(decoded)
+            }
+            None => Ok(revm::primitives::StorageValue::default()),
+        }
+    }
+
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        todo!()
+    }
+}
+
+impl ProviderRW for Store {
+    fn set_preblock_state(&self, prestate: &revm::context::block_states::PreBlockState) {
+        todo!()
+    }
+
+    fn set_storage(
+        &self,
+        addr: Address,
+        storage: revm::primitives::HashMap<
+            revm::primitives::StorageKey,
+            revm::primitives::StorageValue,
+        >,
+    ) {
+        todo!()
+    }
+
+    fn commit_bal_changes(
+        &self,
+        bal: &revm::state::bal::Bal,
+        finalized_bn: alloy_primitives::BlockNumber,
+    ) -> revm::context::block_states::PreBlockState {
+        todo!()
+    }
+
+    fn last_finalized_block_number(&self) -> Option<alloy_primitives::BlockNumber> {
+        todo!()
+    }
+
+    fn lastest_provider_ro<'a>(&'a self) -> Box<dyn DatabaseRef<Error = MyError> + 'a> {
+        let tx_read = self.backend.begin_read().unwrap();
+        Box::new(RocksDbProvider(tx_read))
+    }
 }
 
 #[cfg(test)]
@@ -338,5 +457,31 @@ mod tests {
         });
 
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_mainnet_rocksdb_provider() {
+        let path = "/root/test_nodes/ethereum/execution/reth_rocksdb";
+        let backend = RocksDBBackend::open(path).unwrap();
+        let store = Store::new(backend);
+        println!("getting latest provider");
+        let provider = store.lastest_provider_ro();
+        println!("got latest provider");
+
+        let addr = address!("0x70bC1e16513aD49Bd28c20b7b50679381a71ADF5");
+        // fetch account
+        let acct = provider.basic_ref(addr).unwrap();
+        println!("acct:{:?}", Account::from(acct.clone().unwrap()));
+
+        if let Some(acct) = acct {
+            // fetch storage
+            let key = StorageKey::ZERO;
+            let storage = provider.storage_ref(addr, key.into());
+            println!("storage:{:?}", storage);
+            // fetch code
+            let code = provider.code_by_hash_ref(acct.code_hash).unwrap();
+            assert_eq!(keccak256(code.original_bytes()), acct.code_hash);
+            println!("code len:{}", code.len());
+        }
     }
 }

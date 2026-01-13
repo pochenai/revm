@@ -3419,6 +3419,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "ethrex-storage",
+ "flatdb",
  "reth-db",
  "reth-db-api",
  "reth-primitives-traits",

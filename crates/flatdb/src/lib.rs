@@ -42,10 +42,6 @@ pub trait ProviderRW: Sync {
     ///
     fn set_preblock_state(&self, prestate: &PreBlockState);
     ///
-    fn set_accounts(&self, accts: HashMap<Address, AccountInfo>);
-    ///
-    fn set_codes(&self, codes: HashMap<B256, Bytecode>);
-    ///
     fn set_storage(&self, addr: Address, storage: HashMap<StorageKey, StorageValue>);
     ///
     fn commit_bal_changes(&self, bal: &Bal, finalized_bn: BlockNumber) -> PreBlockState;
@@ -53,7 +49,7 @@ pub trait ProviderRW: Sync {
     fn last_finalized_block_number(&self) -> Option<BlockNumber>;
     /// Create a shared provider for one tx to avoid redudant heap allocation,
     ///  it's almost 50% faster than create a lastest provider for each read.
-    fn lastest_provider_ro(&self) -> LatestProvider;
+    fn lastest_provider_ro<'a>(&'a self) -> Box<dyn DatabaseRef<Error = MyError> + 'a>;
 }
 
 ///
@@ -186,32 +182,6 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
         db_tx.commit().unwrap();
     }
 
-    /// set account info
-    fn set_accounts(&self, accts: HashMap<Address, AccountInfo>) {
-        let provider = self.inner.provider_rw().unwrap();
-        let db_tx = provider.tx_ref();
-        for (addr, info) in accts {
-            db_tx
-                .put::<tables::PlainAccountState>(addr, info.into())
-                .unwrap();
-        }
-
-        provider.commit().unwrap();
-    }
-
-    /// set code
-    fn set_codes(&self, codes: HashMap<B256, Bytecode>) {
-        let provider = self.inner.provider_rw().unwrap();
-        let db_tx = provider.tx_ref();
-        for (code_hash, code) in codes {
-            db_tx
-                .put::<tables::Bytecodes>(code_hash, code.into())
-                .unwrap();
-        }
-
-        provider.commit().unwrap();
-    }
-
     /// set storage
     fn set_storage(&self, addr: Address, storage: HashMap<StorageKey, StorageValue>) {
         let provider = self.inner.provider_rw().unwrap();
@@ -341,9 +311,9 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
     }
 
     /// create a lastest provider for a batched blocks.
-    fn lastest_provider_ro(&self) -> LatestProvider {
+    fn lastest_provider_ro(&self) -> Box<dyn DatabaseRef<Error = MyError>> {
         // here the Boxed provider is returned. I've tried with non-boxed provider, but the perf diff is minimal.
-        LatestProvider(self.inner.latest().unwrap())
+        Box::new(LatestProvider(self.inner.latest().unwrap()))
     }
 }
 

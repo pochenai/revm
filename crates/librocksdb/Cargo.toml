@@ -34,6 +34,7 @@ revm = { workspace = true, features = [
     "tracer",
     "parse",
 ] }
+flatdb.workspace = true
 
 
 [dev-dependencies]
