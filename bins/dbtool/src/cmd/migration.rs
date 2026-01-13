@@ -75,46 +75,46 @@ impl Cmd {
 
         {
             // import account
-            // let src = Arc::clone(&src);
-            // let dst = Arc::clone(&dst);
-            // let handle = thread::spawn(|| {
-            //     let start_key = None;
-            //     let res = import_rocksdb_from_mdbx::<PlainAccountState>(
-            //         src,
-            //         dst,
-            //         start_key,
-            //         DbType::FlatAccount,
-            //         DEBUG,
-            //     );
+            let src = Arc::clone(&src);
+            let dst = Arc::clone(&dst);
+            let handle = thread::spawn(|| {
+                let start_key = None;
+                let res = import_rocksdb_from_mdbx::<PlainAccountState>(
+                    src,
+                    dst,
+                    start_key,
+                    DbType::FlatAccount,
+                    DEBUG,
+                );
 
-            //     match res {
-            //         Err(e) => panic!("failed to import account db:{:?}", e),
-            //         _ => {}
-            //     }
-            // });
-            // handles.push(handle);
+                match res {
+                    Err(e) => panic!("failed to import account db:{:?}", e),
+                    _ => {}
+                }
+            });
+            handles.push(handle);
         }
 
         {
             // import code
-            // let src = Arc::clone(&src);
-            // let dst = Arc::clone(&dst);
-            // let handle = thread::spawn(|| {
-            //     let start_key = None;
-            //     let res = import_rocksdb_from_mdbx::<Bytecodes>(
-            //         src,
-            //         dst,
-            //         start_key,
-            //         DbType::ContractCode,
-            //         DEBUG,
-            //     );
+            let src = Arc::clone(&src);
+            let dst = Arc::clone(&dst);
+            let handle = thread::spawn(|| {
+                let start_key = None;
+                let res = import_rocksdb_from_mdbx::<Bytecodes>(
+                    src,
+                    dst,
+                    start_key,
+                    DbType::ContractCode,
+                    DEBUG,
+                );
 
-            //     match res {
-            //         Err(e) => panic!("failed to import bytecode db:{:?}", e),
-            //         _ => {}
-            //     }
-            // });
-            // handles.push(handle);
+                match res {
+                    Err(e) => panic!("failed to import bytecode db:{:?}", e),
+                    _ => {}
+                }
+            });
+            handles.push(handle);
         }
 
         for h in handles {
