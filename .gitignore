@@ -36,4 +36,4 @@ rustc-ice-*
 *.svg
 perf.data*
 # tmp db
-bins/revme/tmp
+bins/revme/tmp*

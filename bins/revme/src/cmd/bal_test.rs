@@ -12,6 +12,7 @@ use alloy_primitives::{bytes, Bytes};
 use flatdb::{
     MainnetProviderRW, MockProviderRW, ProviderRW, mtcache::{MTCache, SharedCache}, preblock_db_provider::{PreBlockStateCache}
 };
+use librocksdb::store::Store;
 use revm::{
     Context, DatabaseRef, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext, context::{
         BlockEnv, block_states::{
@@ -106,6 +107,8 @@ pub struct Cmd {
     datadir: Option<String>,
     #[arg(long, value_enum, default_value = "par")]
     io: IOPattern,
+    #[arg(long)]
+    db: Option<DBTy>,
     #[arg(long, default_value_t = false)]
     recover_db: bool,
     #[arg(long, default_value_t = false)]
@@ -147,9 +150,20 @@ pub enum IOPattern {
     Batched,
 }
 
+#[derive(Clone, Debug, ValueEnum, Default)]
+enum DBTy {
+    #[default]
+    #[clap(alias = "mdbx")]
+    Mdbx,
+    #[clap(alias = "rocksdb")]
+    RocksDB,
+}
+
+#[derive(Clone)]
 enum DBProvider {
-    MockDB(MockProviderRW),
-    MainnetDB(MainnetProviderRW),
+    MdbxMockDB(MockProviderRW),
+    MdbxMainnetDB(MainnetProviderRW),
+    RocksDB(Store)
 }
 
 impl Deref for DBProvider {
@@ -158,8 +172,9 @@ impl Deref for DBProvider {
     // same as as_rw, just for convenent usage.
     fn deref(&self) -> &Self::Target {
         match self {
-            DBProvider::MockDB(db) => db as _,
-            DBProvider::MainnetDB(db) => db as _,
+            DBProvider::MdbxMockDB(db) => db as _,
+            DBProvider::MdbxMainnetDB(db) => db as _,
+            DBProvider::RocksDB(db) => db as _,
         }
     }
 }
@@ -167,17 +182,9 @@ impl Deref for DBProvider {
 impl DBProvider {
     pub fn as_rw(&self) -> &dyn flatdb::ProviderRW {
         match self {
-            DBProvider::MockDB(db) => db,
-            DBProvider::MainnetDB(db) => db,
-        }
-    }
-
-
-    // It's much slower compare to lastest_provider_ro, due to, it'll alloc a Boxed latest provider for each read.
-    pub fn as_ro(&self) -> Box<dyn DatabaseRef<Error = MyError>+ Sync+'_>  {
-        match self {
-            DBProvider::MockDB(db) => Box::new(db),
-            DBProvider::MainnetDB(db) =>Box::new(db),
+            DBProvider::MdbxMockDB(db) => db,
+            DBProvider::MdbxMainnetDB(db) => db,
+            DBProvider::RocksDB(db) => db as _,
         }
     }
 }
@@ -229,27 +236,55 @@ impl Cmd {
         println!("prestates to cache......");
         let blocks: Vec<alloy_consensus::Block<Recovered<EthereumTxEnvelope<TxEip4844>>>> =
             RecoveredBlockVec(recovered_blocks).into();
+        let last_finalized_block = blocks[0].number - 1;
 
         let database_provider = self.datadir.as_ref().map(|datadir| {
-            if self.mock_db {
-                let datadir = "./tmp";
-                println!("MockDatabase at {} is loaded", datadir);
-                let provider_rw = MockProviderRW::new(datadir.into());
-                let all_pre_state = derive_pre_all_execution_state(&prestates);
-                provider_rw.set_preblock_state(&all_pre_state);
-                DBProvider::MockDB(provider_rw) 
-            } else {
-                let provider_rw = flatdb::MainnetProviderRW::new(datadir.into());
-                let db_finalized_bn = provider_rw.last_finalized_block_number().unwrap();
-                if db_finalized_bn != blocks[0].number - 1 {
-                    panic!("Database finalized block number {} does not match the first block's parent number {}. Please ensure the database is synced to the correct state.", db_finalized_bn, blocks[0].number - 1);
+            let db = self.db.as_ref().expect("Please provide db type!");
+            match db {
+                DBTy::Mdbx => {
+                    if self.mock_db {
+                        let datadir = "./tmp_mdbx";
+                        // println!("Mdbx mocked tmp path:{:?}", datadir);
+                        let provider_rw = MockProviderRW::new(datadir.into());
+                        let all_pre_state = derive_pre_all_execution_state(&prestates);
+                        provider_rw.set_preblock_state(&all_pre_state);
+                        DBProvider::MdbxMockDB(provider_rw) 
+                    } else {
+                        // Don't prestate preblock state here to avoid prefetching the state.
+                        let provider_rw = flatdb::MainnetProviderRW::new(datadir.into());
+                        let db_finalized_bn = provider_rw.last_finalized_block_number().unwrap();
+                        if db_finalized_bn != last_finalized_block {
+                            panic!("Database finalized block number {} does not match the first block's parent number {}. Please ensure the database is synced to the correct state.", db_finalized_bn, last_finalized_block);
+                        }
+                        println!("Mdbx {} loaded at finalized block number {}", datadir,db_finalized_bn);
+                        DBProvider::MdbxMainnetDB(provider_rw) 
+                    }
+                },
+                DBTy::RocksDB => {
+                    if self.mock_db {
+                        // let tempdir = tempfile::Builder::new()
+                        //     .prefix("_path_for_rocksdb_storage")
+                        //     .tempdir()
+                        //     .expect("Failed to create temporary path for the _path_for_rocksdb_storage");
+                        // let datadir = tempdir.path();
+                        let datadir = "./tmp_rocksdb";
+                        println!("Rocksdb mocked tmp path:{:?}", datadir);
+                        let provider_rw = Store::new_rocksdb_backend(datadir);
+                        let all_pre_state = derive_pre_all_execution_state(&prestates);
+                        provider_rw.set_preblock_state(&all_pre_state);
+                        DBProvider::RocksDB(provider_rw) 
+                    } else {
+                        // Don't prestate preblock state here to avoid prefetching the state.
+                        let provider_rw = Store::new_rocksdb_backend(datadir);
+                        println!("RocksDB {} loaded at finalized block number {}", datadir, last_finalized_block);
+                        DBProvider::RocksDB(provider_rw) 
+                    }
                 }
-                println!("Database {} loaded at finalized block number {}", datadir,db_finalized_bn);
-                DBProvider::MainnetDB(provider_rw) 
             }
+
         });
 
-        // recover db seperately, then drop caches and re-run to avoid prefetching effect.
+        // recover db separately, then drop caches and re-run to avoid prefetching effect.
         if self.recover_db {
             if let Some(provider_rw) = database_provider {
                 let all_pre_state = derive_pre_all_execution_state(&prestates);
@@ -259,7 +294,7 @@ impl Cmd {
             return Ok(());
         }
 
-        let caches = prestates_to_cachedbs(prestates);
+        let caches = prestates_to_cachedbs(prestates.clone());
 
         let (gasused, batch_merged_bals, batch_merged_bal_reads) = if self.par {
             let gasused = import_struct(format!("./data/gasused_{nblocks}.json"));
@@ -271,7 +306,7 @@ impl Cmd {
             (vec![], vec![], vec![])
         };
 
-        let prestates = caches_to_prestates(caches, &bals, &blocks, self.pre_tx_state);
+        let adpated_prestates = caches_to_prestates(caches, &bals, &blocks, self.pre_tx_state);
 
         println!("preloading kzg......");
         // preload kzg trusted setup
@@ -295,8 +330,8 @@ impl Cmd {
                     PriorityOrder::None | PriorityOrder::BigBlocksNone => execute_blocks_par(
                         blocks,
                         batch_merged_bals,
-                        prestates,
-                        database_provider,
+                        adpated_prestates,
+                        database_provider.clone(),
                         block_hashes,
                         gasused,
                         self,
@@ -306,7 +341,7 @@ impl Cmd {
                         execute_blocks_par_scheduler(
                             blocks,
                             bals,
-                            prestates,
+                            adpated_prestates,
                             block_hashes,
                             gasused,
                             self,
@@ -316,7 +351,7 @@ impl Cmd {
                 }
             } else {
                 (
-                    execute_blocks(blocks, bals, prestates, block_hashes, self),
+                    execute_blocks(blocks, bals, adpated_prestates, block_hashes, self),
                     Duration::ZERO,
                 )
             }
@@ -328,6 +363,13 @@ impl Cmd {
             gas_used / ((elapsed - commit_time).as_millis() as u64) / 1000,
             elapsed - commit_time,
         );
+
+        // recover db after proccesing blocks separately, then drop caches and re-run to avoid prefetching effect.
+        if let Some(provider_rw) = database_provider {
+            let all_pre_state = derive_pre_all_execution_state(&prestates);
+            provider_rw.as_rw().set_preblock_state(&all_pre_state);
+            println!("state rewinds to block at {}", last_finalized_block);
+        }
 
         Ok(())
     }

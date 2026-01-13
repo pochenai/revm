@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, StorageKey, StorageValue, B256};
+use alloy_primitives::{Address, StorageKey, StorageValue, B256, KECCAK256_EMPTY};
 pub use ethrex_storage::api::tables::{ACCOUNT_CODES, ACCOUNT_FLATKEYVALUE, STORAGE_FLATKEYVALUE};
 use ethrex_storage::api::{PrefixResult, StorageReadView};
 use ethrex_storage::backend::rocksdb::RocksDBBackend;
@@ -32,6 +32,7 @@ pub enum RocksDBError {
     Other(String),
 }
 
+#[derive(Clone)]
 pub struct Store {
     backend: Arc<dyn StorageBackend>,
 }
@@ -222,9 +223,18 @@ impl<'a> DatabaseRef for RocksDbProvider<'a> {
             .map_err(|e| MyError::from(RocksDBError::from(e)))?;
         match v {
             Some(v) => {
-                let decoded: Account =
+                let acct: Account =
                     Decompress::decompress(&v).map_err(|e| MyError::from(RocksDBError::from(e)))?;
-                Ok(Some(decoded.into()))
+                // must get code along with basic account.
+                let code_hash = acct.get_bytecode_hash();
+                let code = if code_hash != KECCAK256_EMPTY {
+                    Some(self.code_by_hash_ref(code_hash).unwrap())
+                } else {
+                    None
+                };
+                let mut acct_info: AccountInfo = acct.into();
+                acct_info.code = code;
+                Ok(Some(acct_info))
             }
             None => Ok(None),
         }
