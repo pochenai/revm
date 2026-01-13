@@ -217,10 +217,9 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
                 .balance
                 .writes
                 .last()
-                .map_or(0, |(v, _)| *v)
-                .max(info_bal.nonce.writes.last().map_or(0, |(v, _)| *v))
-                .max(info_bal.code.writes.last().map_or(0, |(v, _)| *v))
-                + 1;
+                .map_or(0, |(v, _)| *v + 1) // bal index start from 0, so add 1 to differentiate none
+                .max(info_bal.nonce.writes.last().map_or(0, |(v, _)| *v + 1))
+                .max(info_bal.code.writes.last().map_or(0, |(v, _)| *v + 1));
 
             // update changed codes in database
             if info_bal.code.writes.len() > 0 {
@@ -231,7 +230,7 @@ impl<N: ProviderNodeTypes> ProviderRW for ProviderFactoryWrapper<N> {
                     .unwrap();
             }
             // update changed account info in database
-            if max_bal_index > 1 {
+            if max_bal_index > 0 {
                 acct_bal.populate_account_info(max_bal_index as _, &mut info);
             }
 
@@ -478,11 +477,16 @@ mod tests {
 
     use super::*;
     fn provider_with_db_type(mock: bool) {
+        let tempdir = tempfile::Builder::new()
+            .prefix("_path_for_mdbx_storage")
+            .tempdir()
+            .expect("Failed to create temporary path for the _path_for_mdbx_storage");
+        let path = tempdir.path();
         let factory: Box<dyn ProviderRW> = if mock {
-            let p = ProviderFactoryWrapper::<EthereumNode>::new("./temp".into());
+            let p = ProviderFactoryWrapper::<EthereumNode>::new(path.into());
             Box::new(p)
         } else {
-            let p = ProviderFactoryWrapper::<MockNodeTypesWithDB>::new("./temp".into());
+            let p = ProviderFactoryWrapper::<MockNodeTypesWithDB>::new(path.into());
             Box::new(p)
         };
 
@@ -530,7 +534,13 @@ mod tests {
         let addr1 = address!("0x0000000000000000000000000000000000000001");
         let addr2 = address!("0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2");
 
-        let p = ProviderFactoryWrapper::<MockNodeTypesWithDB>::new("./temp".into());
+        let tempdir = tempfile::Builder::new()
+            .prefix("_path_for_mdbx_storage")
+            .tempdir()
+            .expect("Failed to create temporary path for the _path_for_mdbx_storage");
+        let path = tempdir.path();
+
+        let p = ProviderFactoryWrapper::<MockNodeTypesWithDB>::new(path.into());
 
         let slot_key = StorageKey::from_str_radix(
             "f81d8d79f42adb4c73cc3aa0c78e25d3343882d0313c0b80ece3d3a103ef1ec2",

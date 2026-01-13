@@ -2531,6 +2531,7 @@ dependencies = [
  "reth-provider",
  "reth-storage-api",
  "revm 30.2.0",
+ "tempfile",
 ]
 
 [[package]]

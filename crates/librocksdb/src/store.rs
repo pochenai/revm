@@ -6,10 +6,13 @@ use ethrex_storage::{api::StorageBackend, error::StoreError};
 use flatdb::ProviderRW;
 use reth_db::models::CompactU256;
 use reth_db_api::table::{Compress, Decode, Decompress, Encode};
-use reth_primitives_traits::{Account, Bytecode};
+use reth_primitives_traits::{Account, Bytecode, StorageEntry};
+use revm::context::block_states::{MyPlainAccount, PreBlockState};
 use revm::database::states::cache::MyError;
+use revm::database::states::plain_account::PlainStorage;
+use revm::state::AccountInfo;
 use revm::DatabaseRef;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -176,6 +179,22 @@ impl Store {
     ) -> Result<(), RocksDBError> {
         self.set_dup_kvs(STORAGE_FLATKEYVALUE, storages)
     }
+
+    pub fn delete_kvs<K: Encode>(
+        &self,
+        table: &'static str,
+        keys: HashSet<K>,
+    ) -> Result<(), RocksDBError> {
+        let mut txn = self.backend.begin_write()?;
+        for key in keys {
+            txn.delete(table, key.encode().as_ref())?
+        }
+        Ok(txn.commit()?)
+    }
+
+    pub fn delete_accounts<K: Encode>(&self, keys: HashSet<K>) -> Result<(), RocksDBError> {
+        Ok(self.delete_kvs(ACCOUNT_FLATKEYVALUE, keys)?)
+    }
 }
 
 #[inline]
@@ -196,7 +215,6 @@ pub struct RocksDbProvider<'a>(Box<dyn StorageReadView + 'a>);
 impl<'a> DatabaseRef for RocksDbProvider<'a> {
     type Error = MyError;
     fn basic_ref(&self, address: Address) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
-        println!("basic_ref...");
         let tx_read = &self.0;
         let encoded_key = address.encode();
         let v = tx_read
@@ -213,7 +231,6 @@ impl<'a> DatabaseRef for RocksDbProvider<'a> {
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
-        println!("code_by_hash_ref...");
         let tx_read = &self.0;
         let encoded_key = code_hash.encode();
         let v = tx_read
@@ -236,7 +253,6 @@ impl<'a> DatabaseRef for RocksDbProvider<'a> {
         address: Address,
         index: revm::primitives::StorageKey,
     ) -> Result<revm::primitives::StorageValue, Self::Error> {
-        println!("storage ref...");
         let tx_read = &self.0;
         let encoded_addr = address.encode();
         let slot: StorageKey = index.into();
@@ -264,7 +280,35 @@ impl<'a> DatabaseRef for RocksDbProvider<'a> {
 
 impl ProviderRW for Store {
     fn set_preblock_state(&self, prestate: &revm::context::block_states::PreBlockState) {
-        todo!()
+        let mut accounts = HashMap::new();
+        let mut codes = HashMap::new();
+        let mut storages = vec![];
+
+        for (addr, plain_account) in &prestate.accounts {
+            let info = match &plain_account.info {
+                Some(v) => v,
+                None => &AccountInfo::default(),
+            };
+            let acct: Account = info.into();
+            accounts.insert(*addr, acct);
+
+            if let Some(code) = &info.code {
+                let code: Bytecode = code.clone().into();
+                codes.insert(info.code_hash, code);
+            }
+
+            for (key, val) in &plain_account.storage {
+                let key: StorageKey = key.clone().into();
+                let val: CompactU256 = val.clone().into();
+                storages.push((*addr, key, val));
+            }
+        }
+        self.set_accounts(accounts)
+            .expect("failed to set preblock accounts state");
+        self.set_codes(codes)
+            .expect("failed to set preblock codes state");
+        self.set_storages(storages)
+            .expect("failed to set preblock storages state");
     }
 
     fn set_storage(
@@ -283,11 +327,91 @@ impl ProviderRW for Store {
         bal: &revm::state::bal::Bal,
         finalized_bn: alloy_primitives::BlockNumber,
     ) -> revm::context::block_states::PreBlockState {
-        todo!()
+        let mut accounts = HashMap::new();
+        let mut codes = HashMap::new();
+        let mut storages = vec![];
+        let mut accounts_to_delete = HashSet::new();
+
+        let mut latest_state = PreBlockState::default();
+
+        let provider_ro = self.lastest_provider_ro();
+
+        for (addr, acct_bal) in bal.accounts.iter() {
+            let info_bal = &acct_bal.account_info;
+            let storage_bals = &acct_bal.storage;
+
+            // fetch changed account info first. Must use basic_ref instead of provider_ro.basic_account to also fetch code.
+            let prev_info = provider_ro.basic_ref(*addr).unwrap().unwrap_or_default();
+            let mut info: AccountInfo = prev_info.clone();
+            let max_bal_index = info_bal
+                .balance
+                .writes
+                .last()
+                .map_or(0, |(v, _)| *v + 1)
+                .max(info_bal.nonce.writes.last().map_or(0, |(v, _)| *v + 1))
+                .max(info_bal.code.writes.last().map_or(0, |(v, _)| *v + 1));
+
+            // update changed codes in database
+            if info_bal.code.writes.len() > 0 {
+                let (code_hash, code) = info_bal.code.writes.last().unwrap().1.clone();
+                let code: Bytecode = code.clone().into();
+                codes.insert(code_hash, code);
+            }
+            // update changed account info in database
+            if max_bal_index > 0 {
+                acct_bal.populate_account_info(max_bal_index as _, &mut info);
+            }
+
+            let mut latest_info = None;
+
+            if info.is_empty() {
+                accounts_to_delete.insert(*addr);
+            } else {
+                latest_info = Some(info.clone());
+
+                let acct: Account = info.into();
+                accounts.insert(*addr, acct);
+            }
+
+            let mut latest_storage = PlainStorage::default();
+            // update changed storages in database
+            for (key, bal_writes) in storage_bals.storage.iter() {
+                if bal_writes.writes.len() > 0 {
+                    let entry = StorageEntry::new(
+                        (*key).into(),
+                        bal_writes.writes.last().unwrap().1.into(),
+                    );
+
+                    latest_storage.insert(*key, bal_writes.writes.last().unwrap().1);
+
+                    let key: StorageKey = key.clone().into();
+                    let val: CompactU256 = entry.value.into();
+                    storages.push((*addr, key, val));
+                }
+            }
+
+            let latest_acct = MyPlainAccount {
+                info: latest_info,
+                storage: latest_storage,
+            };
+
+            latest_state.accounts.insert(*addr, latest_acct);
+        }
+
+        self.delete_accounts(accounts_to_delete)
+            .expect("failed to delete accounts when commmiting bal changes");
+        self.set_accounts(accounts)
+            .expect("failed to set accounts when commmiting bal changes");
+        self.set_codes(codes)
+            .expect("failed to set codes when commmiting bal changes");
+        self.set_storages(storages)
+            .expect("failed to set storages when commmiting bal changes");
+
+        latest_state
     }
 
     fn last_finalized_block_number(&self) -> Option<alloy_primitives::BlockNumber> {
-        todo!()
+        Some(23769999)
     }
 
     fn lastest_provider_ro<'a>(&'a self) -> Box<dyn DatabaseRef<Error = MyError> + 'a> {
@@ -304,7 +428,8 @@ mod tests {
     use ethrex_storage::api::{StorageBackend, StorageReadView, StorageWriteBatch};
     use ethrex_storage::backend::in_memory::InMemoryBackend;
     use ethrex_storage::backend::rocksdb::RocksDBBackend;
-    use revm::primitives::StorageValue;
+    use revm::primitives::{StorageValue, KECCAK_EMPTY};
+    use revm::state::bal::{AccountBal, Bal, BalWrites};
 
     use std::sync::Arc;
     use std::thread;
@@ -395,7 +520,7 @@ mod tests {
         assert!(matches!(store.storage(addr2, slot3), Ok(Some(val)) if val3 == val.into()));
     }
 
-    fn setup_backend() -> RocksDBBackend {
+    fn setup_mock_backend() -> RocksDBBackend {
         let tempdir = tempfile::Builder::new()
             .prefix("_path_for_rocksdb_storage")
             .tempdir()
@@ -408,19 +533,19 @@ mod tests {
 
     #[test]
     fn test_store_basic_account_works() {
-        let backend = setup_backend();
+        let backend = setup_mock_backend();
         store_basic_account(backend);
     }
 
     #[test]
     fn test_store_code_by_hash_works() {
-        let backend = setup_backend();
+        let backend = setup_mock_backend();
         store_code_by_hash(backend);
     }
 
     #[test]
     fn test_storage_works() {
-        let backend = setup_backend();
+        let backend = setup_mock_backend();
         store_storage(backend);
     }
 
@@ -483,5 +608,150 @@ mod tests {
             assert_eq!(keccak256(code.original_bytes()), acct.code_hash);
             println!("code len:{}", code.len());
         }
+    }
+
+    fn provider_with_rocksdb_backend(factory: Store) {
+        // set some accounts
+        let mut prestate: PreBlockState = PreBlockState::default();
+        let addr = address!("0x1000000000000000000000000000000000000000");
+        let mut acct = AccountInfo::default();
+        acct.nonce = 1;
+        acct.balance = U256::from(0x3635c9adc5dea00000u128);
+        // preset some codes
+        let code = hex!("5a465a905090036002900360015500");
+        let code_hash = keccak256(code);
+        let code = revm::bytecode::Bytecode::new_raw(code.to_vec().into());
+        acct.code_hash = code_hash;
+        acct.code = Some(code.clone());
+        let mut plain_acct = MyPlainAccount::default();
+        plain_acct.info = Some(acct.clone());
+
+        // preset some storages
+        let key = revm::primitives::StorageKey::ONE;
+        let value = StorageValue::ONE * StorageValue::from(4);
+        let mut storage = HashMap::default();
+        storage.insert(key, value);
+        plain_acct.storage = storage;
+        prestate.insert_account(addr, &plain_acct);
+
+        // set initial state in db
+        factory.set_preblock_state(&prestate);
+
+        let provider = factory.lastest_provider_ro();
+        // fetch account
+        assert!(matches!(provider.basic_ref(addr), Ok(Some(acct_info)) if acct_info == acct));
+        // fetch storage
+        assert!(matches!(provider.storage_ref(addr, key), Ok(val_1) if val_1 == value));
+        // fetch code
+        assert!(matches!(provider.code_by_hash_ref(code_hash), Ok(code_1) if code_1 == code));
+    }
+
+    #[test]
+    fn test_provider_set_preblock_state_works() {
+        let backend = setup_mock_backend();
+        let store = Store::new(backend);
+        provider_with_rocksdb_backend(store);
+    }
+
+    fn provider_commit_bal(factory: Store) {
+        let addr1 = address!("0x0000000000000000000000000000000000000001");
+        let addr2 = address!("0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2");
+
+        let slot_key = revm::primitives::StorageKey::from_str_radix(
+            "f81d8d79f42adb4c73cc3aa0c78e25d3343882d0313c0b80ece3d3a103ef1ec2",
+            16,
+        )
+        .unwrap();
+        let slot_val = revm::primitives::StorageKey::from_str_radix(
+            "6912101300000000000000005d48e1115dd60da0",
+            16,
+        )
+        .unwrap();
+        let mut c1 = PreBlockState::default();
+        let mut cache_acct_1 = MyPlainAccount::default();
+        cache_acct_1.storage.insert(slot_key, slot_val);
+        c1.accounts.insert(addr2, cache_acct_1.clone());
+        factory.set_preblock_state(&c1);
+
+        assert!(
+            matches!(factory.lastest_provider_ro().storage_ref(addr2, slot_key), Ok(val) if val == slot_val)
+        );
+
+        let mut bal = Bal::default();
+        let mut acct_bal = AccountBal::default();
+        acct_bal.account_info.nonce.writes.push((0, 1));
+        acct_bal.account_info.nonce.writes.push((1, 2));
+        acct_bal
+            .account_info
+            .balance
+            .writes
+            .push((0, U256::from(1000u64)));
+        acct_bal
+            .account_info
+            .balance
+            .writes
+            .push((1, U256::from(2000u64)));
+        let slot_val_new =
+            StorageValue::from_str_radix("6912103700000000000000005d48e1115dd60da0", 16).unwrap();
+        acct_bal
+            .storage
+            .storage
+            .insert(slot_key, BalWrites::new(vec![(1, slot_val_new)]));
+
+        bal.accounts.insert(addr1, acct_bal.clone());
+
+        let code = hex!("5a465a905090036002900360015500");
+        let code_hash = keccak256(code);
+        let code = revm::bytecode::Bytecode::new_raw(code.to_vec().into());
+        acct_bal
+            .account_info
+            .code
+            .writes
+            .push((0, (code_hash, code.clone())));
+
+        bal.accounts.insert(addr2, acct_bal);
+
+        // commit bal changes to db
+        factory.commit_bal_changes(&bal, 0);
+
+        let provider = factory.lastest_provider_ro();
+        // verify changes
+        assert!(
+            matches!(provider.basic_ref(addr1), Ok(Some(acct_info)) if acct_info.nonce == 2 && acct_info.balance == U256::from(2000u64) && acct_info.code_hash == KECCAK_EMPTY)
+        );
+        assert!(
+            matches!(provider.basic_ref(addr2), Ok(Some(acct_info)) if acct_info.code_hash == code_hash)
+        );
+        assert!(
+            matches!(provider.code_by_hash_ref(code_hash), Ok(code_1) if code_1 == code && keccak256(code_1.original_bytes()) == code_hash)
+        );
+        assert!(matches!(provider.storage_ref(addr2, slot_key), Ok(val) if val == slot_val_new));
+
+        // delete the account
+        let mut acct_bal = AccountBal::default();
+        acct_bal.account_info.nonce.writes.push((0, 0));
+        acct_bal
+            .account_info
+            .balance
+            .writes
+            .push((0, U256::from(0)));
+        acct_bal
+            .account_info
+            .code
+            .writes
+            .push((0, (KECCAK_EMPTY, code)));
+        let mut bal = Bal::default();
+        bal.accounts.insert(addr1, acct_bal);
+        factory.commit_bal_changes(&bal, 0);
+
+        let provider = factory.lastest_provider_ro();
+        assert!(matches!(provider.basic_ref(addr1), Ok(None)));
+    }
+
+    #[test]
+    fn test_provider_commit_bal_should_match() {
+        let backend = setup_mock_backend();
+        let store = Store::new(backend);
+        provider_commit_bal(store);
     }
 }
