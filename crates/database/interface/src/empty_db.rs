@@ -55,7 +55,7 @@ impl<E> EmptyDBTyped<E> {
     }
 }
 
-impl<E: DBErrorMarker + Error> Database for EmptyDBTyped<E> {
+impl<E: DBErrorMarker + Error + Sync + Send> Database for EmptyDBTyped<E> {
     type Error = E;
 
     #[inline]
@@ -83,7 +83,7 @@ impl<E: DBErrorMarker + Error> Database for EmptyDBTyped<E> {
     }
 }
 
-impl<E: DBErrorMarker + Error> DatabaseRef for EmptyDBTyped<E> {
+impl<E: DBErrorMarker + Error + Sync + Send> DatabaseRef for EmptyDBTyped<E> {
     type Error = E;
 
     #[inline]

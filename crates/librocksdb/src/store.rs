@@ -1,6 +1,6 @@
 use alloy_primitives::{Address, StorageKey, StorageValue, B256, KECCAK256_EMPTY};
 pub use ethrex_storage::api::tables::{ACCOUNT_CODES, ACCOUNT_FLATKEYVALUE, STORAGE_FLATKEYVALUE};
-use ethrex_storage::api::{PrefixResult, StorageReadView};
+use ethrex_storage::api::{PrefixResult, StorageLockedView, StorageReadView};
 use ethrex_storage::backend::rocksdb::RocksDBBackend;
 use ethrex_storage::{api::StorageBackend, error::StoreError};
 use flatdb::ProviderRW;
@@ -288,6 +288,88 @@ impl<'a> DatabaseRef for RocksDbProvider<'a> {
     }
 }
 
+/// Create one provider which is shared across all threads, no performance gain.
+pub struct RocksDbLockedProvider<'a> {
+    acct: Box<dyn StorageLockedView + 'a>,
+    code: Box<dyn StorageLockedView + 'a>,
+    storage: Box<dyn StorageLockedView + 'a>,
+}
+
+impl<'a> DatabaseRef for RocksDbLockedProvider<'a> {
+    type Error = MyError;
+    fn basic_ref(&self, address: Address) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
+        let tx_read = &self.acct;
+        let encoded_key = address.encode();
+        let v = tx_read
+            .get(&encoded_key)
+            .map_err(|e| MyError::from(RocksDBError::from(e)))?;
+        match v {
+            Some(v) => {
+                let acct: Account =
+                    Decompress::decompress(&v).map_err(|e| MyError::from(RocksDBError::from(e)))?;
+                // must get code along with basic account.
+                let code_hash = acct.get_bytecode_hash();
+                let code = if code_hash != KECCAK256_EMPTY {
+                    Some(self.code_by_hash_ref(code_hash).unwrap())
+                } else {
+                    None
+                };
+                let mut acct_info: AccountInfo = acct.into();
+                acct_info.code = code;
+                Ok(Some(acct_info))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
+        let tx_read = &self.code;
+        let encoded_key = code_hash.encode();
+        let v = tx_read
+            .get(&encoded_key)
+            .map_err(|e| MyError::from(RocksDBError::from(e)))?;
+        match v {
+            Some(v) => {
+                let decoded: Bytecode =
+                    Decompress::decompress(&v).map_err(|e| MyError::from(RocksDBError::from(e)))?;
+                Ok(decoded.into())
+            }
+            None => Err(MyError {
+                message: format!("[rocksdb] code for codehash:{code_hash} not found"),
+            }),
+        }
+    }
+
+    fn storage_ref(
+        &self,
+        address: Address,
+        index: revm::primitives::StorageKey,
+    ) -> Result<revm::primitives::StorageValue, Self::Error> {
+        let tx_read = &self.storage;
+        let encoded_addr = address.encode();
+        let slot: StorageKey = index.into();
+        let encoded_slot = slot.encode();
+        // Apply a prefix with an invalid nibble (17) as a separator
+        let encoded_key = addr_slot_key(&encoded_addr[..], &encoded_slot[..]);
+        let v = tx_read
+            .get(&encoded_key)
+            .map_err(|e| MyError::from(RocksDBError::from(e)))?;
+        match v {
+            Some(v) => {
+                let decoded: CompactU256 =
+                    Decompress::decompress(&v).map_err(|e| MyError::from(RocksDBError::from(e)))?;
+                let decoded = decoded.into();
+                Ok(decoded)
+            }
+            None => Ok(revm::primitives::StorageValue::default()),
+        }
+    }
+
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        todo!()
+    }
+}
+
 impl ProviderRW for Store {
     fn set_preblock_state(&self, prestate: &revm::context::block_states::PreBlockState) {
         let mut accounts = HashMap::new();
@@ -427,6 +509,12 @@ impl ProviderRW for Store {
     fn lastest_provider_ro<'a>(&'a self) -> Box<dyn DatabaseRef<Error = MyError> + 'a> {
         let tx_read = self.backend.begin_read().unwrap();
         Box::new(RocksDbProvider(tx_read))
+
+        // Box::new(RocksDbLockedProvider {
+        //     acct: self.backend.begin_locked(ACCOUNT_FLATKEYVALUE).unwrap(),
+        //     code: self.backend.begin_locked(ACCOUNT_CODES).unwrap(),
+        //     storage: self.backend.begin_locked(STORAGE_FLATKEYVALUE).unwrap(),
+        // })
     }
 }
 

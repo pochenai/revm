@@ -973,6 +973,8 @@ fn execute_blocks_par(
     let mut current_bn = blocks[0].number;
     let mut commit_time = Duration::ZERO;
     let mut prefetch_time = Duration::ZERO;
+    let mut acct_prefetch_time = Duration::ZERO;
+    let mut storage_prefetch_time = Duration::ZERO;
 
     let mut in_mem = VecDeque::with_capacity(2);
 
@@ -1000,10 +1002,12 @@ fn execute_blocks_par(
 
                         let mut p = PreBlockStateCache::new(db.as_rw());
                         let bal_read = &batch_merged_bal_reads[chunk_idx];
-                        p.batch_preblock_state(bal_read, cmd_env.io_threads);
+                        let (acct_time, storage_time) = p.batch_preblock_state(bal_read, cmd_env.io_threads);
                         println!("prefetched all state for blocks:[{}-{}]", start_block*(chunk_idx as u64), start_block*((chunk_idx as u64)+1));
 
                         prefetch_time += start.elapsed();
+                        acct_prefetch_time += acct_time;
+                        storage_prefetch_time += storage_time;
                         Some(p)
                     },
                     IOPattern::Parallel => None,
@@ -1162,7 +1166,7 @@ fn execute_blocks_par(
     }
 
     println!("total commit time:{:?}", commit_time);
-    println!("total prefetch time:{:?}", prefetch_time);
+    println!("total prefetch time:{:?}, acct:{:?}(0 should be ignored), storage:{:?}(0 should be ignored)", prefetch_time, acct_prefetch_time, storage_prefetch_time);
     println!("execute_blocks_par complete!");
     (total_gas_used, commit_time)
 }

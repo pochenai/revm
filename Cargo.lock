@@ -2518,6 +2518,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
+ "crossbeam",
  "dashmap",
  "eyre",
  "rayon",

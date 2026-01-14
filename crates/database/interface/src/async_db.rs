@@ -191,7 +191,7 @@ impl<T: DatabaseAsync> Database for WrapDatabaseAsync<T> {
     }
 }
 
-impl<T: DatabaseAsyncRef> DatabaseRef for WrapDatabaseAsync<T> {
+impl<T: DatabaseAsyncRef + Sync + Send> DatabaseRef for WrapDatabaseAsync<T> {
     type Error = T::Error;
 
     #[inline]

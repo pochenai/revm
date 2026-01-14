@@ -47,6 +47,7 @@ revm = { workspace = true, features = [
 eyre.workspace = true
 rayon.workspace = true
 dashmap.workspace = true
+crossbeam.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -108,7 +108,7 @@ where
 impl<DB, MEM> DatabaseRef for MTCache<DB, MEM>
 where
     DB: DatabaseRef<Error = MyError>,
-    MEM: Iterable,
+    MEM: Iterable + Sync + Send,
 {
     #[doc = " The database error type."]
     type Error = MyError;
