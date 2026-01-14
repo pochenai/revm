@@ -1,7 +1,7 @@
 use crossbeam::channel;
 use rayon::ThreadPoolBuilder;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     time::{Duration, Instant},
 };
 
@@ -13,7 +13,6 @@ use revm::{
     state::{bal::Bal, AccountInfo, Bytecode},
     DatabaseRef,
 };
-use std::sync::Arc;
 
 use crate::ProviderRW;
 
