@@ -1,8 +1,10 @@
+pub use crate::ethrex_storage::api::tables::{
+    ACCOUNT_CODES, ACCOUNT_FLATKEYVALUE, STORAGE_FLATKEYVALUE,
+};
+use crate::ethrex_storage::api::{PrefixResult, StorageLockedView, StorageReadView};
+use crate::ethrex_storage::backend::rocksdb::RocksDBBackend;
+use crate::ethrex_storage::{api::StorageBackend, error::StoreError};
 use alloy_primitives::{Address, StorageKey, StorageValue, B256, KECCAK256_EMPTY};
-pub use ethrex_storage::api::tables::{ACCOUNT_CODES, ACCOUNT_FLATKEYVALUE, STORAGE_FLATKEYVALUE};
-use ethrex_storage::api::{PrefixResult, StorageLockedView, StorageReadView};
-use ethrex_storage::backend::rocksdb::RocksDBBackend;
-use ethrex_storage::{api::StorageBackend, error::StoreError};
 use flatdb::ProviderRW;
 use reth_db::models::CompactU256;
 use reth_db_api::table::{Compress, Decode, Decompress, Encode};
@@ -215,6 +217,8 @@ pub struct RocksDbProvider<'a>(Box<dyn StorageReadView + 'a>);
 
 impl<'a> DatabaseRef for RocksDbProvider<'a> {
     type Error = MyError;
+
+    #[inline]
     fn basic_ref(&self, address: Address) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
         let tx_read = &self.0;
         let encoded_key = address.encode();
@@ -240,6 +244,7 @@ impl<'a> DatabaseRef for RocksDbProvider<'a> {
         }
     }
 
+    #[inline]
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
         let tx_read = &self.0;
         let encoded_key = code_hash.encode();
@@ -258,6 +263,7 @@ impl<'a> DatabaseRef for RocksDbProvider<'a> {
         }
     }
 
+    #[inline]
     fn storage_ref(
         &self,
         address: Address,
@@ -297,6 +303,7 @@ pub struct RocksDbLockedProvider<'a> {
 
 impl<'a> DatabaseRef for RocksDbLockedProvider<'a> {
     type Error = MyError;
+    #[inline]
     fn basic_ref(&self, address: Address) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
         let tx_read = &self.acct;
         let encoded_key = address.encode();
@@ -322,6 +329,7 @@ impl<'a> DatabaseRef for RocksDbLockedProvider<'a> {
         }
     }
 
+    #[inline]
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
         let tx_read = &self.code;
         let encoded_key = code_hash.encode();
@@ -340,6 +348,7 @@ impl<'a> DatabaseRef for RocksDbLockedProvider<'a> {
         }
     }
 
+    #[inline]
     fn storage_ref(
         &self,
         address: Address,
@@ -522,10 +531,6 @@ impl ProviderRW for Store {
 mod tests {
     use super::*;
     use alloy_primitives::{address, hex, keccak256, U256};
-    use ethrex_storage::api::tables::ACCOUNT_FLATKEYVALUE;
-    use ethrex_storage::api::{StorageBackend, StorageReadView, StorageWriteBatch};
-    use ethrex_storage::backend::in_memory::InMemoryBackend;
-    use ethrex_storage::backend::rocksdb::RocksDBBackend;
     use revm::primitives::{StorageValue, KECCAK_EMPTY};
     use revm::state::bal::{AccountBal, Bal, BalWrites};
 

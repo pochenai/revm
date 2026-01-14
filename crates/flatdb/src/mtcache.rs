@@ -114,6 +114,7 @@ where
     type Error = MyError;
 
     #[doc = " Gets basic account information."]
+    #[inline]
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         if let Some(mem) = &self.in_memory {
             for state in mem.iter() {
@@ -141,6 +142,7 @@ where
     }
 
     #[doc = " Gets account code by its hash."]
+    #[inline]
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         if let Some(mem) = &self.in_memory {
             // not neccesary due to it's already returned by the basic_ref.
@@ -165,6 +167,7 @@ where
     }
 
     #[doc = " Gets storage value of address at index."]
+    #[inline]
     fn storage_ref(
         &self,
         address: Address,

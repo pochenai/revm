@@ -325,6 +325,7 @@ impl DatabaseRef for LatestProvider {
     type Error = MyError;
 
     #[doc = " Gets basic account information."]
+    #[inline]
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let provider = &self.0;
         let acct = provider.basic_account(&address);
@@ -353,6 +354,7 @@ impl DatabaseRef for LatestProvider {
     }
 
     #[doc = " Gets account code by its hash."]
+    #[inline]
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         let provider = &self.0;
         let code = provider.bytecode_by_hash(&code_hash);
@@ -382,6 +384,7 @@ impl DatabaseRef for LatestProvider {
     }
 
     #[doc = " Gets block hash by block number."]
+    #[inline]
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
         todo!()
     }
@@ -394,6 +397,7 @@ impl<N: ProviderNodeTypes> DatabaseRef for ProviderFactoryWrapper<N> {
     type Error = MyError;
 
     #[doc = " Gets basic account information."]
+    #[inline]
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let provider: Box<dyn StateProvider> = self.inner.latest().unwrap();
         let acct = provider.basic_account(&address);
@@ -422,6 +426,7 @@ impl<N: ProviderNodeTypes> DatabaseRef for ProviderFactoryWrapper<N> {
     }
 
     #[doc = " Gets account code by its hash."]
+    #[inline]
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         let provider = self.inner.latest().unwrap();
         let code = provider.bytecode_by_hash(&code_hash);
@@ -435,6 +440,7 @@ impl<N: ProviderNodeTypes> DatabaseRef for ProviderFactoryWrapper<N> {
     }
 
     #[doc = " Gets storage value of address at index."]
+    #[inline]
     fn storage_ref(
         &self,
         address: Address,

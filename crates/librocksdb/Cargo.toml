@@ -12,11 +12,18 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# ethrex related
+# rocksdb related
 thiserror.workspace = true
-ethrex_storage = { git = "https://github.com/lambdaclass/ethrex.git", package = "ethrex-storage", features = [
-    "rocksdb",
+rocksdb = { version = "0.24.0", default-features = false, features = [
+    "bindgen-runtime",
+    "lz4",
 ] }
+tracing = { version = "0.1", features = ["log"] }
+# ethrex_storage = { git = "https://github.com/lambdaclass/ethrex.git", package = "ethrex-storage", features = [
+#     "rocksdb",
+# ] }
+serde_json.workspace = true
+serde.workspace = true
 
 
 # reth related

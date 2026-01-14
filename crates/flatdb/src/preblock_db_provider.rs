@@ -137,7 +137,7 @@ impl<'a> PreBlockStateCache<'a> {
 
     /// schedule with rayon
     /// TODO: reset rayon threads number
-    pub fn batch_preblock_state(
+    pub fn batch_preblock_state_unnested(
         &mut self,
         bal_read: &BalReadsTy,
         threads: usize,
@@ -193,7 +193,7 @@ impl<'a> PreBlockStateCache<'a> {
     }
 
     /// nested parallel prefetching scheduler
-    pub fn batch_preblock_state_nested(
+    pub fn batch_preblock_state(
         &mut self,
         bal_read: &BalReadsTy,
         threads: usize,
@@ -239,6 +239,7 @@ impl<'a> DatabaseRef for PreBlockStateCache<'a> {
     type Error = MyError;
 
     #[doc = " Gets basic account information."]
+    #[inline]
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         if let Some(acct) = self.accounts.get(&address) {
             Ok(acct.info.clone())
@@ -253,6 +254,7 @@ impl<'a> DatabaseRef for PreBlockStateCache<'a> {
     }
 
     #[doc = " Gets storage value of address at index."]
+    #[inline]
     fn storage_ref(
         &self,
         address: Address,
