@@ -1165,8 +1165,20 @@ fn execute_blocks_par(
         }
     }
 
+
+    // IO metrics
+    let mut acct_reads = 0;
+    let mut storage_reads = 0;
+    for bal in &batch_merged_bal_reads{
+        acct_reads += bal.len();
+        for (_addr, keys) in bal {
+            storage_reads += keys.len();
+        }
+    }
+
     println!("total commit time:{:?}", commit_time);
     println!("total prefetch time:{:?}, acct:{:?}(0 should be ignored), storage:{:?}(0 should be ignored)", prefetch_time, acct_prefetch_time, storage_prefetch_time);
+    println!("total I/O:{}, account reads:{}, storage reads:{}, avg per I/O cost:{:.2} µs (0 should be ignored)", acct_reads + storage_reads, acct_reads, storage_reads, prefetch_time.as_micros() as f64 / ((acct_reads + storage_reads)/cmd_env.io_threads) as f64);
     println!("execute_blocks_par complete!");
     (total_gas_used, commit_time)
 }
