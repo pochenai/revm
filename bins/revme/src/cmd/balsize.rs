@@ -65,7 +65,8 @@ impl Cmd {
         );
 
         println!(
-            "Size reduced without read: {:.2}%",
+            "{:<40} {:>12.2}%",
+            "Size reduced without read: ",
             100.0 * (total_size as f64 - total_size_no_read as f64) / total_size as f64
         );
 
