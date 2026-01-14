@@ -512,7 +512,7 @@ impl ProviderRW for Store {
     }
 
     fn last_finalized_block_number(&self) -> Option<alloy_primitives::BlockNumber> {
-        Some(23769999)
+        todo!()
     }
 
     fn lastest_provider_ro<'a>(&'a self) -> Box<dyn DatabaseRef<Error = MyError> + 'a> {
