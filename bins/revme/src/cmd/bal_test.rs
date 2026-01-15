@@ -1123,13 +1123,14 @@ fn execute_blocks_par(
         if debug {
             let mut max_elapsed = Duration::ZERO;
             let mut max_elapsed_idx = 0;
-            let mut max_elapsed_tx = &chunk_results[0].3;
+            // should check chunk_results len first, because there might be empty blocks.
+            // let mut max_elapsed_tx = &chunk_results[0].3;
             let mut max_block_index: usize = 0;
             for (bal_index_unmerged, _, elapsed, tx, block_index, _gas_used) in &chunk_results {
                 if elapsed > &max_elapsed {
                     max_elapsed = *elapsed;
                     max_elapsed_idx = bal_index_unmerged - 1;
-                    max_elapsed_tx = tx;
+                    // max_elapsed_tx = tx;
                     max_block_index = *block_index;
                 }
             }
