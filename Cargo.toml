@@ -37,7 +37,7 @@ members = [
     "examples/custom_opcodes",
     "examples/custom_precompile_journal",
     "crates/flatdb",
-    "crates/librocksdb",
+    "crates/librocksdb", "crates/libmdbx",
 ]
 resolver = "2"
 default-members = ["crates/revm"]

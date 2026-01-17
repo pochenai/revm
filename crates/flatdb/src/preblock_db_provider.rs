@@ -136,63 +136,70 @@ impl<'a> PreBlockStateCache<'a> {
 
     /// schedule with rayon
     /// TODO: reset rayon threads number
-    pub fn batch_preblock_state_unnested(
+    pub fn batch_preblock_state(
         &mut self,
         bal_read: &BalReadsTy,
         threads: usize,
     ) -> (Duration, Duration) {
-        let start = Instant::now();
-        let mut accounts = bal_read
-            .par_iter()
-            .map_init(
-                || self.db.lastest_provider_ro(), // create a provider for each thread
-                |provider_ro, (address, _)| {
-                    let info = provider_ro.basic_ref(*address).unwrap();
-                    (
-                        *address,
-                        PlainAccount {
-                            info,
-                            storage: HashMap::default(),
-                        },
-                    )
-                },
-            )
-            .collect::<HashMap<_, _>>();
-        let acct_duration = start.elapsed();
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
 
-        // storage
-        let start = Instant::now();
-        let mut storage: HashMap<_, _> = bal_read
-            .par_iter()
-            .map(|(address, slots)| {
-                let storage = slots
-                    .par_iter()
-                    .map_init(
-                        || self.db.lastest_provider_ro(),
-                        |provider_ro, key| {
-                            let k: StorageKey = (*key).into();
-                            let v = provider_ro.storage_ref(*address, k).unwrap();
-                            (k, v)
-                        },
-                    )
-                    .collect::<HashMap<_, _>>();
+        pool.install(|| {
+            let start = Instant::now();
+            let mut accounts = bal_read
+                .par_iter()
+                .map_init(
+                    || self.db.lastest_provider_ro(), // create a provider for each thread
+                    |provider_ro, (address, _)| {
+                        let info = provider_ro.basic_ref(*address).unwrap();
+                        (
+                            *address,
+                            PlainAccount {
+                                info,
+                                storage: HashMap::default(),
+                            },
+                        )
+                    },
+                )
+                .collect::<HashMap<_, _>>();
+            let acct_duration = start.elapsed();
 
-                (*address, storage)
-            })
-            .collect();
+            // storage
+            let start = Instant::now();
+            let mut storage: HashMap<_, _> = bal_read
+                .par_iter()
+                .map(|(address, slots)| {
+                    let storage = slots
+                        .par_iter()
+                        .map_init(
+                            || self.db.lastest_provider_ro(),
+                            |provider_ro, key| {
+                                let k: StorageKey = (*key).into();
+                                let v = provider_ro.storage_ref(*address, k).unwrap();
+                                (k, v)
+                            },
+                        )
+                        .collect::<HashMap<_, _>>();
 
-        for (addr, plain_acct) in &mut accounts {
-            let s = storage.remove(addr).unwrap();
-            plain_acct.storage = s;
-        }
-        self.accounts = accounts;
-        let storage_duration = start.elapsed();
+                    (*address, storage)
+                })
+                .collect();
 
-        (acct_duration, storage_duration)
+            for (addr, plain_acct) in &mut accounts {
+                let s = storage.remove(addr).unwrap();
+                plain_acct.storage = s;
+            }
+            self.accounts = accounts;
+            let storage_duration = start.elapsed();
+
+            (acct_duration, storage_duration)
+        })
     }
 
     /// nested parallel prefetching scheduler
-    pub fn batch_preblock_state(
+    pub fn batch_preblock_state_nested(
         &mut self,
         bal_read: &BalReadsTy,
         threads: usize,
