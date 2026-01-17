@@ -1,0 +1,22 @@
+[package]
+name = "libmdbx"
+version = "0.1.0"
+license.workspace = true
+authors.workspace = true
+categories.workspace = true
+keywords.workspace = true
+repository.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+bytes.workspace = true
+alloy-primitives.workspace = true
+reth-codecs = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-codecs" }
+parity-scale-codec = "3.2.1"
+[lints]
+workspace = true
