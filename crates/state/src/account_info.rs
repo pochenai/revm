@@ -1,3 +1,4 @@
+use alloy_rlp::RlpEncodable;
 use bytecode::Bytecode;
 use core::{
     cmp::Ordering,
@@ -57,6 +58,27 @@ impl From<&AccountInfo> for reth_primitives_traits::Account {
             balance: acct.balance,
             nonce: acct.nonce,
             bytecode_hash: Some(acct.code_hash),
+        }
+    }
+}
+
+#[derive(Default, Debug, RlpEncodable)]
+///
+pub struct AccountRLP {
+    ///
+    pub balance: U256,
+    ///
+    pub nonce: u64,
+    ///
+    pub code_hash: B256,
+}
+
+impl From<AccountInfo> for AccountRLP {
+    fn from(acct: AccountInfo) -> Self {
+        AccountRLP {
+            balance: acct.balance,
+            nonce: acct.nonce,
+            code_hash: acct.code_hash,
         }
     }
 }

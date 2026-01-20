@@ -1,5 +1,10 @@
+use std::{iter::zip, thread};
+
 use clap::Parser;
-use revm::{context::block_states::import_struct, state::bal::Bal};
+use revm::{
+    context::block_states::{import_struct, AccountStates, PreBlockState},
+    state::bal::Bal,
+};
 
 /// `balsize` subcommand
 #[derive(Parser, Debug, Default)]
@@ -13,23 +18,42 @@ impl Cmd {
     /// Run the `balsize` command
     pub fn run(&self) -> Result<(), super::Error> {
         let nblocks = self.nblocks;
-        let bals: Vec<Bal> = import_struct(format!("./data/bals_{nblocks}.json"));
-        // with read
-        let mut total_size = 0;
-        let mut max_size = 0;
+
+        let bals_f = thread::spawn(move || import_struct(format!("./data/bals_{nblocks}.json")));
+
+        let prestates_f =
+            thread::spawn(move || import_struct(format!("./data/prestates_{nblocks}.json")));
+
+        let bals: Vec<Bal> = bals_f.join().unwrap();
+        let prestates: Vec<PreBlockState> = prestates_f.join().unwrap();
+
+        // with read keys and values
+        let mut total_size_read_kvs = 0;
+        let mut max_size_read_kvs = 0;
+        // with read keys
+        let mut total_size_read_keys = 0;
+        let mut max_size_read_keys = 0;
         // without read
         let mut total_size_no_read = 0;
         let mut max_size_no_read = 0;
 
         let nblocks = bals.len();
 
-        for bal in bals {
+        for (bal, prestate) in zip(bals, prestates) {
+            let prestate_rlp = prestate.into_encodable_state(&bal);
+
             let alloy_bal = bal.into_alloy_bal();
             let mut buf = Vec::new();
             alloy_rlp::encode_list(&alloy_bal, &mut buf);
 
-            total_size += buf.len();
-            max_size = max_size.max(buf.len());
+            let bal_read_len = buf.len();
+            total_size_read_keys += bal_read_len;
+            max_size_read_keys = max_size_read_keys.max(buf.len());
+
+            buf.clear();
+            alloy_rlp::encode_list(&prestate_rlp, &mut buf);
+            total_size_read_kvs += bal_read_len + buf.len();
+            max_size_read_kvs = max_size_read_kvs.max(buf.len());
 
             let alloy_bal_no_read: Vec<_> = alloy_bal
                 .into_iter()
@@ -55,8 +79,14 @@ impl Cmd {
 
         println!(
             "{:<40} {:>12} bytes",
-            "BAL with read, avg rlp-enc size:",
-            format_with_commas((total_size / nblocks) as u64),
+            "BAL with read kvs, avg rlp-enc size:",
+            format_with_commas((total_size_read_kvs / nblocks) as u64),
+        );
+
+        println!(
+            "{:<40} {:>12} bytes",
+            "BAL with read keys, avg rlp-enc size:",
+            format_with_commas((total_size_read_keys / nblocks) as u64),
         );
         println!(
             "{:<40} {:>12} bytes",
@@ -65,9 +95,11 @@ impl Cmd {
         );
 
         println!(
-            "{:<40} {:>12.2}%",
-            "Size reduced without read: ",
-            100.0 * (total_size as f64 - total_size_no_read as f64) / total_size as f64
+            "Size reduced without read, relative to with read kvs:{:.2}, only keys:{:.2}",
+            100.0 * (total_size_read_kvs as f64 - total_size_no_read as f64)
+                / total_size_read_kvs as f64,
+            100.0 * (total_size_read_keys as f64 - total_size_no_read as f64)
+                / total_size_read_keys as f64
         );
 
         Ok(())

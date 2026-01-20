@@ -7,6 +7,7 @@ use std::{fs, os};
 use crate::TxEnv;
 use alloy_consensus::transaction::Recovered;
 use alloy_consensus::{BlockBody, EthereumTxEnvelope, Header, Transaction, TxEip4844};
+use alloy_rlp::{RlpEncodable, RlpMaxEncodedLen};
 use bitvec::vec;
 use context_interface::block::{BlobExcessGasAndPrice, Block};
 use context_interface::either::Either;
@@ -14,10 +15,12 @@ use context_interface::transaction::{AccessList, RecoveredAuthorization, SignedA
 use database::states::plain_account::PlainStorage;
 use database::states::CacheAccount;
 use database::{AccountState, AccountStatus, Cache, CacheState, DbAccount, PlainAccount};
+use primitives::alloy_primitives::{StorageKey, StorageValue};
 use primitives::HashMap;
 use primitives::{eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE, Address, B256, U256};
 use serde::{Deserialize, Serialize};
-use state::AccountInfo;
+use state::bal::Bal;
+use state::{AccountInfo, AccountRLP};
 
 ///
 pub type RethBlock = alloy_consensus::Block<Recovered<EthereumTxEnvelope<TxEip4844>>>;
@@ -92,6 +95,27 @@ pub struct MyPlainAccount {
     pub storage: PlainStorage,
 }
 
+#[derive(Debug, Default, RlpEncodable)]
+#[rlp(trailing)]
+/// Pre-block account states. Address is only presented when it's not in the read or write set.
+pub struct AccountStates {
+    ///
+    pub storage: Vec<StorageKV>,
+    ///
+    pub addr: Option<Address>,
+    ///
+    pub info: Option<AccountRLP>,
+}
+
+#[derive(Debug, Default, RlpEncodable, RlpMaxEncodedLen)]
+///
+pub struct StorageKV {
+    ///
+    pub key: StorageKey,
+    ///
+    pub val: StorageValue,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 ///
 pub struct PreBlockState {
@@ -128,6 +152,34 @@ impl PreBlockState {
                 }
             }
         }
+    }
+
+    /// Convert to RLP encodable state
+    pub fn into_encodable_state(self, bal: &Bal) -> Vec<AccountStates> {
+        let mut states = vec![];
+        for (address, acct) in self.accounts {
+            let mut state = AccountStates::default();
+            acct.storage.into_iter().for_each(|(key, val)| {
+                state.storage.push(StorageKV {
+                    key: key.into(),
+                    val,
+                });
+            });
+
+            state.info = if let Some(info) = acct.info {
+                Some(info.into())
+            } else {
+                None
+            };
+            // only insert account address when it's not in bal accounts
+            if !bal.accounts.contains_key(&address) {
+                state.addr = Some(address);
+            }
+
+            states.push(state);
+        }
+
+        states
     }
 }
 

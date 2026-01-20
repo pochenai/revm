@@ -5110,6 +5110,7 @@ name = "revm-context"
 version = "10.1.2"
 dependencies = [
  "alloy-consensus",
+ "alloy-rlp",
  "bitvec",
  "cfg-if",
  "derive-where",
@@ -5424,6 +5425,7 @@ name = "revm-state"
 version = "8.0.2"
 dependencies = [
  "alloy-eip7928",
+ "alloy-rlp",
  "bitflags 2.9.3",
  "reth-primitives-traits",
  "revm-bytecode 7.0.2",

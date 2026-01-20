@@ -21,6 +21,7 @@ workspace = true
 # revm
 primitives.workspace = true
 bytecode.workspace = true
+alloy-rlp = { workspace = true, features = ["arrayvec", "derive", "std"] }
 
 # alloy
 alloy-eip7928.workspace = true
