@@ -1,4 +1,5 @@
 pub mod bal_test;
+pub mod bal_worst;
 pub mod balsize;
 pub mod bench;
 pub mod blockchaintest;
@@ -30,6 +31,8 @@ pub enum MainCmd {
     Baltest(bal_test::Cmd),
     /// Execute Bal in memory execution benchmark.
     Balsize(balsize::Cmd),
+    /// Execute Bal worse cast I/O benchmark.
+    Balworst(bal_worst::Cmd),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +61,7 @@ impl MainCmd {
             Self::Blockchaintest(cmd) | Self::Btest(cmd) => cmd.run()?,
             Self::Baltest(cmd) => cmd.run()?,
             Self::Balsize(cmd) => cmd.run()?,
+            Self::Balworst(cmd) => cmd.run()?,
         }
         Ok(())
     }
