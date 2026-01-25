@@ -35,6 +35,8 @@ pub struct Cmd {
     io: IOPattern,
     #[arg(long, default_value_t = 16)]
     io_threads: usize,
+    #[arg(short = 't', default_value_t = 16)]
+    threads: usize,
     #[arg(long)]
     datadir: String,
 }
@@ -64,6 +66,12 @@ impl Cmd {
                 );
             }
             IOPattern::Parallel => {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(self.threads)
+                    .thread_name(|i| format!("rayon-{}", i))
+                    .build_global()
+                    .unwrap();
+
                 let res: Vec<_> = bal_read
                     .par_iter()
                     .map_init(
@@ -73,7 +81,7 @@ impl Cmd {
                             let mut vals = Vec::with_capacity(storage.len());
                             for key in storage.iter() {
                                 let val = provider_ro.storage_ref(*address, *key).unwrap();
-                                vals.push(val);
+                                vals.push(1);
                             }
 
                             vals
