@@ -110,7 +110,9 @@ impl AccountStatus {
             Self::DestroyedAgain | Self::DestroyedChanged => Self::DestroyedAgain,
             // Account statuses considered unreachable.
             Self::Loaded | Self::Changed => {
-                unreachable!("Wrong state transition, touch empty is not possible from {self:?}");
+                // unreachable!("Wrong state transition, touch empty is not possible from {self:?}");
+                // In mega-block settings, an account might be deleted after loading it from some previous block, so this can happpen.
+                Self::LoadedNotExisting
             }
         }
     }

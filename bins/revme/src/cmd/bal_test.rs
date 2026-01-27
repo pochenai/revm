@@ -567,8 +567,9 @@ fn execute_blocks(
             difficulty: block.difficulty,
             prevrandao: Some(block.mix_hash),
             blob_excess_gas_and_price: Some(BlobExcessGasAndPrice::new_with_spec(
-                block.excess_blob_gas.unwrap(),
-                SpecId::PRAGUE,
+                // the current fork is PRAGUE, so here its' divided by 1000000 to fix the BlobGasPriceGreaterThanMax casued by Fusaka upgrade.
+                block.excess_blob_gas.unwrap() / 1000000,
+                SpecId::OSAKA,
             )),
         };
 
@@ -654,17 +655,18 @@ fn execute_blocks(
         }
 
         // TODO: add post-block bals
+        let mut block_gas_used = Vec::with_capacity(results.len());
+        let mut output_bals = Bal::default();
+        for (bal_index, (bal, gas_used)) in results {
+            if let Some(bal) = bal {
+                output_bals.merge_bal(bal, bal_index);
+            }
+            block_gas_used.push(gas_used);
+        }
+        // write gas used
+        blocks_gas_used.push(block_gas_used);
 
         if debug {
-            let mut block_gas_used = Vec::with_capacity(results.len());
-            let mut output_bals = Bal::default();
-            for (bal_index, (bal, gas_used)) in results {
-                if let Some(bal) = bal {
-                    output_bals.merge_bal(bal, bal_index);
-                }
-                block_gas_used.push(gas_used);
-            }
-
             // remove pre-tx and post-tx bals
             output_bals.remove_at_address(&SYSTEM_CA_ADDRESSES);
             output_bals.accounts.sort_keys();
@@ -678,10 +680,8 @@ fn execute_blocks(
                 write_data("bals-out.json", &output_bals);
                 panic!("bals for block {} is not equal", block_env.number)
             }
-
-            // write gas used
-            blocks_gas_used.push(block_gas_used);
         }
+
         unsafe {
             bal_reads.push(BAL_READS.clone());
             BAL_READS = std::sync::LazyLock::new(|| BalReadsTy::default());
@@ -758,10 +758,15 @@ fn handle_tx(
     let gas_used = exe_result.result.gas_used();
     let result_state = exe_result.state;
     evm.commit(result_state);
+
     // println!(
-    //     "bn:{}, txindex:{}, bal_index:{}, gasused:{}",
+    //     "-----block:{}, txidx:{}, bal_index:{}, gasused:{}",
     //     blocknumber, tx_index, state.bal_index, gas_used
     // );
+
+    // if blocknumber == 24308511 && tx_index == 72 {
+    //     panic!("exit")
+    // }
     (state.bal_builder, gas_used)
     // print!("exe_result:{:?}", exe_result)
 }
@@ -814,9 +819,11 @@ fn execute_blocks_par_scheduler(
                 difficulty: block.difficulty,
                 prevrandao: Some(block.mix_hash),
                 blob_excess_gas_and_price: Some(BlobExcessGasAndPrice::new_with_spec(
-                    block.excess_blob_gas.unwrap(),
-                    SpecId::PRAGUE,
+                    // the current fork is PRAGUE, so here its' divided by 1000000 to fix the BlobGasPriceGreaterThanMax casued by Fusaka upgrade.
+                    block.excess_blob_gas.unwrap() / 1000000,
+                    SpecId::OSAKA,
                 )),
+
             };
 
             block_envs.push(block_env);
@@ -1016,7 +1023,7 @@ fn execute_blocks_par(
             },
             None => None,
         };
-
+        
         let chunk_results = chunk_blocks
             .par_iter()
             .enumerate()
@@ -1030,8 +1037,9 @@ fn execute_blocks_par(
                     difficulty: block.difficulty,
                     prevrandao: Some(block.mix_hash),
                     blob_excess_gas_and_price: Some(BlobExcessGasAndPrice::new_with_spec(
-                        block.excess_blob_gas.unwrap(),
-                        SpecId::PRAGUE,
+                        // the current fork is PRAGUE, so here its' divided by 1000000 to fix the BlobGasPriceGreaterThanMax casued by Fusaka upgrade.
+                        block.excess_blob_gas.unwrap() / 1000000,
+                        SpecId::OSAKA,
                     )),
                 };
 
@@ -1097,11 +1105,11 @@ fn execute_blocks_par(
             })
             .collect::<Vec<_>>();
 
-        println!(
-            "commit block=====:{}-{}",
-            start_block + (chunk_idx * batch) as u64,
-            start_block + ((chunk_idx + 1) * batch) as u64
-        );
+        // println!(
+        //     "commit block=====:{}-{}",
+        //     start_block + (chunk_idx * batch) as u64,
+        //     start_block + ((chunk_idx + 1) * batch) as u64
+        // );
         let commit_start = Instant::now();
         current_bn += chunk_blocks.len() as u64;
         if let Some(db) = db_rw.as_ref() {

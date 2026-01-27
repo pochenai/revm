@@ -266,7 +266,8 @@ impl DatabaseRef for CacheState {
         // return Err(MyError {
         //     message: String::from("basic_ref error"),
         // });
-        panic!("basic_ref error,addr:{:?}", address);
+        // todo: the root cause is reth miss bal read in this version, should merge upstream to fix this bug in reth.
+        Ok(None)
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {

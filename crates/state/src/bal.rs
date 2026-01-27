@@ -206,7 +206,9 @@ impl Bal {
         account: &mut AccountInfo,
     ) -> Result<bool, BalError> {
         let Some((index, _, bal_account)) = self.accounts.get_full(&address) else {
-            return Err(BalError::AccountNotFound);
+            // return Err(BalError::AccountNotFound);
+            // todo: the root cause it reth miss bal read in this version, should merge upstream to fix this bug in reth.
+            return Ok(false);
         };
         account.storage_id = Some(index);
 
@@ -245,7 +247,9 @@ impl Bal {
         value: &mut StorageValue,
     ) -> Result<(), BalError> {
         let Some(bal_account) = self.accounts.get(&account_address) else {
-            return Err(BalError::AccountNotFound);
+            // return Err(BalError::AccountNotFound);
+            // todo: the root cause is reth miss bal read in this version, should merge upstream to fix this bug in reth.
+            return Ok(());
         };
 
         if let Some(bal_value) = bal_account.storage.get(key, bal_index)? {

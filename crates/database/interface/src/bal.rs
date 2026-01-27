@@ -148,17 +148,6 @@ impl<'a, DB: Database> Database for BalDatabase<'a, DB> {
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let mut basic = self.db.basic(address).map_err(BalDatabaseError::Database)?;
-        dprintln!(
-            "db basic, addr:{}, info:{:?}, codelen:{}",
-            address,
-            RethAccount::from(basic.clone().unwrap_or(AccountInfo::default())),
-            basic
-                .as_ref()
-                .unwrap_or(&AccountInfo::default())
-                .code
-                .as_ref()
-                .map_or(0, |c| c.len())
-        );
 
         unsafe {
             if DUMP_BAL_READ {
@@ -167,20 +156,39 @@ impl<'a, DB: Database> Database for BalDatabase<'a, DB> {
         }
 
         if let Some(bal) = &self.bal {
-            let is_none = basic.is_none();
-            let mut bal_basic = basic.unwrap_or_default();
-            if bal.populate_account_info(address, self.bal_index, &mut bal_basic)? {
-                // return new basic if it got changed.
-                return Ok(Some(bal_basic));
-            }
-
-            // if it is not changed, check if it is none and return it.
-            if is_none {
-                return Ok(None);
-            }
-
-            basic = Some(bal_basic);
+            basic = match basic {
+                Some(mut acct) => {
+                    bal.populate_account_info(address, self.bal_index, &mut acct)?;
+                    Some(acct)
+                }
+                None => {
+                    let mut acct = AccountInfo::default();
+                    if bal.populate_account_info(address, self.bal_index, &mut acct)? {
+                        Some(acct)
+                    } else {
+                        None
+                    }
+                }
+            };
         }
+
+        if matches!(basic.as_ref(), Some(acct) if acct.is_empty()) {
+            basic = None;
+        }
+
+        dprintln!(
+            "db basic, addr:{}, info:{:?}, codelen:{}",
+            address,
+            basic
+                .clone()
+                .map_or(None, |acct| Some(RethAccount::from(acct))),
+            basic
+                .as_ref()
+                .unwrap_or(&AccountInfo::default())
+                .code
+                .as_ref()
+                .map_or(0, |c| c.len())
+        );
 
         Ok(basic)
     }
@@ -204,7 +212,6 @@ impl<'a, DB: Database> Database for BalDatabase<'a, DB> {
             .db
             .storage(address, key)
             .map_err(BalDatabaseError::Database)?;
-        dprintln!("db store, addr:{}, key:{}, value:{:?}", address, key, value);
         unsafe {
             if DUMP_BAL_READ {
                 let entry = BAL_READS.entry(address).or_default();
@@ -215,6 +222,7 @@ impl<'a, DB: Database> Database for BalDatabase<'a, DB> {
             bal.populate_storage_slot(address, self.bal_index, key, &mut value)
                 .map_err(BalDatabaseError::Bal)?;
         }
+        dprintln!("db store, addr:{}, key:{}, value:{:?}", address, key, value);
         Ok(value)
     }
 

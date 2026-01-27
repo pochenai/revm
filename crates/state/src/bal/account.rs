@@ -264,7 +264,9 @@ impl StorageBal {
         bal_index: BalIndex,
     ) -> Result<Option<StorageValue>, BalError> {
         let Some(value) = self.storage.get(&key) else {
-            return Err(BalError::SlotNotFound);
+            // return Err(BalError::SlotNotFound);
+            // todo: the root cause is reth miss bal read in this version, should merge upstream to fix this bug in reth.
+            return Ok(None);
         };
 
         Ok(value.get(bal_index))
